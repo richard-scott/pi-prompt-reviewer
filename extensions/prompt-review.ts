@@ -8,7 +8,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@mariozechner/pi-coding-agent";
-import type { AutocompleteItem } from "@mariozechner/pi-tui";
+import { Key, type AutocompleteItem } from "@mariozechner/pi-tui";
 
 type ReviewContextMode = "off" | "smart" | "always";
 type ReviewerThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -45,8 +45,6 @@ type ReviewRunResult = {
 
 type ParsedReview = {
   decision: "ready" | "revised" | "needs_clarification" | "unknown";
-  summary: string;
-  notes: string[];
   questions: string[];
   prompt: string;
 };
@@ -61,12 +59,19 @@ type ReviewContext = {
   assistantReply?: ContextBlock;
 };
 
-const ROOT_COMMAND_OPTIONS = ["on", "off", "toggle", "status", "help", "context", "model", "thinking"] as const;
+type ActiveReview = {
+  originalText: string;
+  reviewedText: string;
+};
+
+const ROOT_COMMAND_OPTIONS = ["on", "off", "toggle", "status", "help", "context", "model", "thinking", "revert"] as const;
 const CONTEXT_MODE_OPTIONS = ["off", "smart", "always"] as const;
 const THINKING_LEVEL_OPTIONS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 const DEFAULT_CONTEXT_MODE: ReviewContextMode = "smart";
 const DEFAULT_REVIEWER_THINKING: ReviewerThinkingLevel = "off";
 const REVIEW_STATE_ENTRY = "prompt-review:state";
+const REVIEW_WIDGET_KEY = "prompt-review";
+const REVERT_SHORTCUT_LABEL = "Ctrl+Alt+R";
 const MAX_CONTEXT_CHARS = 4_000;
 const AUTO_REVIEWER_MODEL_CANDIDATES = [
   "haiku",
@@ -166,6 +171,7 @@ function buildHelpText(
     "  /prompt-review model <model-pattern>",
     "  /prompt-review thinking",
     "  /prompt-review thinking off|minimal|low|medium|high|xhigh",
+    "  /prompt-review revert",
     "",
     `Current mode: ${enabled ? "enabled" : "disabled"}`,
     `Current context mode: ${contextMode}`,
@@ -176,7 +182,8 @@ function buildHelpText(
     "- normal prompts are intercepted before they reach the main session",
     "- a lightweight review session reviews and rewrites the prompt",
     "- the reviewed prompt is loaded back into the editor",
-    "- press Enter a second time to actually send it",
+    "- review details are shown above the editor",
+    `- press Enter to send the reviewed prompt, or use /prompt-review revert or ${REVERT_SHORTCUT_LABEL} to restore the original`,
     "",
     "Context modes:",
     "- off: do not send recent conversation context",
@@ -233,10 +240,6 @@ function buildReviewPrompt(prompt: string, context?: ReviewContext): string {
     "",
     "Return exactly this format:",
     "DECISION: ready|revised|needs_clarification",
-    "SUMMARY: <one short line>",
-    "NOTES:",
-    "- <bullet>",
-    "- <bullet>",
     "",
     "FINAL_PROMPT_START",
     "<the final prompt that should be sent to the main session>",
@@ -250,7 +253,7 @@ function buildReviewPrompt(prompt: string, context?: ReviewContext): string {
     "- Always include a complete sendable prompt between FINAL_PROMPT_START and FINAL_PROMPT_END.",
     "- If the prompt is already good, keep it nearly unchanged and use DECISION: ready.",
     "- Use DECISION: needs_clarification only when a missing detail would materially improve the result.",
-    "- Keep NOTES short and actionable.",
+    "- Always correct obvious typos and spelling mistakes in the final prompt.",
     "- Do not mention this reviewer, subagents, or internal process inside the final prompt.",
     hasContext
       ? "- Treat any recent conversation context as reference only. Use it only to resolve referential wording in the new prompt."
@@ -298,7 +301,6 @@ function parseListSection(name: string, text: string): string[] {
 
 function parseReview(text: string): ParsedReview {
   const decisionMatch = text.match(/^DECISION:\s*(.+)$/im);
-  const summaryMatch = text.match(/^SUMMARY:\s*(.+)$/im);
   const promptMatch = text.match(/FINAL_PROMPT_START\s*([\s\S]*?)\s*FINAL_PROMPT_END/i);
 
   const decisionRaw = decisionMatch?.[1]?.trim().toLowerCase() ?? "unknown";
@@ -309,8 +311,6 @@ function parseReview(text: string): ParsedReview {
 
   return {
     decision,
-    summary: summaryMatch?.[1]?.trim() ?? "",
-    notes: parseListSection("NOTES", text),
     questions: parseListSection("QUESTIONS", text),
     prompt: promptMatch?.[1]?.trim() ?? "",
   };
@@ -333,7 +333,7 @@ function formatCost(cost: number | undefined): string | undefined {
   return `Cost: $${cost.toFixed(4)}`;
 }
 
-function formatReviewBody(
+function formatReviewWidgetLines(
   review: ParsedReview,
   changed: boolean,
   contextLabel: string,
@@ -341,40 +341,41 @@ function formatReviewBody(
   reviewerThinking: ReviewerThinkingLevel,
   tokens: TokenUsage | undefined,
   cost: number | undefined,
-): string {
-  const lines: string[] = [
-    `Context sent to reviewer: ${contextLabel}`,
-    `Reviewer: ${reviewerModelLabel} (thinking: ${reviewerThinking})`,
+): string[] {
+  const metadataParts = [
+    `context: ${contextLabel}`,
+    `reviewer: ${reviewerModelLabel}`,
+    `thinking: ${reviewerThinking}`,
   ];
 
-  const tokenUsage = formatTokenUsage(tokens);
-  if (tokenUsage) lines.push(tokenUsage);
+  const tokenUsage = formatTokenUsage(tokens)?.replace(/^Usage:\s*/, "usage: ");
+  if (tokenUsage) metadataParts.push(tokenUsage);
 
-  const costLine = formatCost(cost);
-  if (costLine) lines.push(costLine);
+  const costLine = formatCost(cost)?.replace(/^Cost:\s*/, "cost: ");
+  if (costLine) metadataParts.push(costLine);
 
-  if (review.summary) {
-    lines.push(`Summary: ${review.summary}`);
-  }
-
-  if (review.notes.length > 0) {
-    lines.push("", "Notes:", ...review.notes.slice(0, 5).map((note) => `- ${note}`));
-  }
+  const lines: string[] = [
+    changed
+      ? "Prompt review ready"
+      : review.decision === "needs_clarification"
+        ? "Prompt review: needs clarification"
+        : "Prompt review result",
+    metadataParts.join(" · "),
+  ];
 
   if (review.questions.length > 0) {
     lines.push("", "Questions to consider:", ...review.questions.slice(0, 5).map((question) => `- ${question}`));
   }
 
-  lines.push(
-    "",
-    changed
-      ? "Select Yes to load the reviewed prompt into the editor."
-      : "The reviewer kept your prompt essentially unchanged.",
-    "Select No to restore your original prompt instead.",
-    "Press Enter again after the prompt is in the editor to send it.",
-  );
+  lines.push("");
 
-  return lines.join("\n").trim();
+  if (!changed) {
+    lines.push("The reviewer kept your prompt essentially unchanged.");
+  }
+
+  lines.push(`Press Enter to send it, or use /prompt-review revert or ${REVERT_SHORTCUT_LABEL} to restore the original prompt.`);
+
+  return lines;
 }
 
 const REVIEWER_SYSTEM_PROMPT = [
@@ -394,6 +395,7 @@ const REVIEWER_SYSTEM_PROMPT = [
   "- Do not add extra goals the user did not ask for.",
   "- Improve clarity, sequencing, constraints, expected output, and missing",
   "  context.",
+  "- Always correct obvious typos and spelling mistakes.",
   "- Keep the final prompt concise and practical.",
   "- Never mention this reviewer, internal process, or implementation details",
   "  in the final prompt.",
@@ -749,15 +751,66 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
   let reviewerModel: string | undefined;
   let reviewerThinking: ReviewerThinkingLevel = DEFAULT_REVIEWER_THINKING;
   let approvedPrompt: string | undefined;
+  let activeReview: ActiveReview | undefined;
   let currentCtx: ExtensionContext | undefined;
   let reviewInFlight = false;
 
+  const clearReviewWidget = (ctx: ExtensionContext | undefined = currentCtx) => {
+    if (!ctx?.hasUI) return;
+    ctx.ui.setWidget(REVIEW_WIDGET_KEY, undefined);
+  };
+
   const restorePromptToEditor = (text: string, message: string) => {
     if (!currentCtx?.hasUI) return;
+    clearReviewWidget(currentCtx);
+    activeReview = undefined;
     approvedPrompt = text;
     currentCtx.ui.setEditorText(text);
     currentCtx.ui.notify(message, "info");
     updateStatus(currentCtx, enabled, contextMode, reviewInFlight);
+  };
+
+  const revertActiveReview = (ctx: ExtensionContext) => {
+    if (!ctx.hasUI) return false;
+    if (!activeReview) {
+      ctx.ui.notify("No reviewed prompt is waiting in the editor.", "info");
+      return false;
+    }
+
+    restorePromptToEditor(
+      activeReview.originalText,
+      "Original prompt restored. Press Enter to send it, or edit it first.",
+    );
+    return true;
+  };
+
+  const showReviewWidget = (
+    ctx: ExtensionContext,
+    review: ParsedReview,
+    changed: boolean,
+    contextLabel: string,
+    reviewerModelLabel: string,
+    reviewerThinking: ReviewerThinkingLevel,
+    tokens: TokenUsage | undefined,
+    cost: number | undefined,
+  ) => {
+    if (!ctx.hasUI) return;
+
+    const lines = formatReviewWidgetLines(
+      review,
+      changed,
+      contextLabel,
+      reviewerModelLabel,
+      reviewerThinking,
+      tokens,
+      cost,
+    );
+    const themeColor = review.decision === "needs_clarification" ? "warning" : "accent";
+
+    ctx.ui.setWidget(REVIEW_WIDGET_KEY, (_tui, theme) => ({
+      render: () => lines.map((line) => (line ? theme.fg(themeColor, line) : line)),
+      invalidate: () => {},
+    }));
   };
 
   const runPromptReview = async (
@@ -772,7 +825,9 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     currentCtx = ctx;
     approvedPrompt = undefined;
+    activeReview = undefined;
     reviewInFlight = false;
+    clearReviewWidget(ctx);
 
     const state = readState(ctx);
     enabled = state.enabled;
@@ -784,7 +839,9 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async (_event, ctx) => {
     approvedPrompt = undefined;
+    activeReview = undefined;
     reviewInFlight = false;
+    clearReviewWidget(ctx);
     currentCtx = undefined;
     if (ctx.hasUI) ctx.ui.setStatus("prompt-review", undefined);
   });
@@ -960,6 +1017,26 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
         return;
       }
 
+      if (action === "revert") {
+        if (rest.length > 0 || value) {
+          const message = "Too many arguments for /prompt-review revert.";
+          if (ctx.hasUI) {
+            ctx.ui.notify(message, "error");
+          } else {
+            process.stderr.write(`${message}\n`);
+          }
+          return;
+        }
+
+        if (!ctx.hasUI) {
+          process.stdout.write("/prompt-review revert is only available in interactive mode.\n");
+          return;
+        }
+
+        revertActiveReview(ctx);
+        return;
+      }
+
       if (rest.length > 0 || value) {
         const message = `Unknown option: ${args}. Use /prompt-review help.`;
         if (ctx.hasUI) {
@@ -981,7 +1058,11 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
       }
 
       enabled = action === "toggle" ? !enabled : action === "on";
-      if (!enabled) approvedPrompt = undefined;
+      if (!enabled) {
+        approvedPrompt = undefined;
+        activeReview = undefined;
+        clearReviewWidget(ctx);
+      }
       persistState(pi, { enabled, contextMode, reviewerModel, reviewerThinking });
       updateStatus(ctx, enabled, contextMode, reviewInFlight);
 
@@ -994,6 +1075,13 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
     },
   });
 
+  pi.registerShortcut(Key.ctrlAlt("r"), {
+    description: "Restore the original prompt after prompt review",
+    handler: async (ctx) => {
+      revertActiveReview(ctx);
+    },
+  });
+
   pi.on("input", async (event, ctx) => {
     currentCtx = ctx;
 
@@ -1003,17 +1091,25 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
     if (event.images && event.images.length > 0) return { action: "continue" };
     if (!event.text.trim()) return { action: "continue" };
 
+    if (activeReview && event.text !== activeReview.reviewedText) {
+      activeReview = undefined;
+      clearReviewWidget(ctx);
+    }
+
     if (event.text.startsWith("\\")) {
       approvedPrompt = undefined;
       return { action: "transform", text: event.text.slice(1) };
     }
 
     if (event.text.startsWith("/") || event.text.startsWith("!")) {
+      approvedPrompt = undefined;
       return { action: "continue" };
     }
 
     if (approvedPrompt && event.text === approvedPrompt) {
       approvedPrompt = undefined;
+      activeReview = undefined;
+      clearReviewWidget(ctx);
       return { action: "continue" };
     }
 
@@ -1022,6 +1118,9 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
       ctx.ui.notify("A prompt review is already running. Wait for it to finish first.", "warning");
       return { action: "handled" };
     }
+
+    clearReviewWidget(ctx);
+    activeReview = undefined;
 
     const reviewContext = getReviewContext(ctx, event.text, contextMode);
     const resolvedReviewerModel = await resolveReviewerModel(ctx, reviewerModel);
@@ -1115,37 +1214,27 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
     const candidatePrompt = review.prompt || pending.originalText;
     const changed = candidatePrompt.trim() !== pending.originalText.trim();
 
-    const accepted = await ctx.ui.confirm(
-      changed
-        ? "Reviewed prompt ready"
-        : review.decision === "needs_clarification"
-          ? "Prompt needs clarification"
-          : "Prompt review result",
-      formatReviewBody(
-        review,
-        changed,
-        pending.contextLabel,
-        pending.reviewerModelLabel,
-        pending.reviewerThinking,
-        reviewRun.tokens,
-        reviewRun.cost,
-      ),
+    approvedPrompt = candidatePrompt;
+    activeReview = {
+      originalText: pending.originalText,
+      reviewedText: candidatePrompt,
+    };
+    ctx.ui.setEditorText(candidatePrompt);
+    showReviewWidget(
+      ctx,
+      review,
+      changed,
+      pending.contextLabel,
+      pending.reviewerModelLabel,
+      pending.reviewerThinking,
+      reviewRun.tokens,
+      reviewRun.cost,
     );
-
-    if (accepted) {
-      approvedPrompt = candidatePrompt;
-      ctx.ui.setEditorText(candidatePrompt);
-      ctx.ui.notify(
-        `Reviewed prompt loaded. Context sent to reviewer: ${pending.contextLabel}. Press Enter again to send it.`,
-        "info",
-      );
-      updateStatus(ctx, enabled, contextMode, false);
-    } else {
-      restorePromptToEditor(
-        pending.originalText,
-        "Original prompt restored. Press Enter again to send it, or edit it first.",
-      );
-    }
+    ctx.ui.notify(
+      `Reviewed prompt loaded. Press Enter to send it, or use /prompt-review revert or ${REVERT_SHORTCUT_LABEL} to restore the original.`,
+      "info",
+    );
+    updateStatus(ctx, enabled, contextMode, false);
 
     return { action: "handled" };
   });

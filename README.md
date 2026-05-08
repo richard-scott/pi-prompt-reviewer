@@ -17,7 +17,9 @@ prompt before it is sent to the main session.
 - rewrites prompts for clarity while preserving intent
 - can include recent conversation context when useful
 - lets you choose the reviewer model and thinking level
-- shows a confirmation dialog before the reviewed prompt is sent
+- loads the reviewed prompt back into the editor automatically
+- shows compact review details in a widget above the editor instead of a modal dialog
+- lets you restore the original prompt with a command or shortcut
 - displays token usage and cost for the review step
 - retries once with a safe fallback if the reviewer returns no text
 
@@ -46,25 +48,9 @@ After installing or editing the extension, reload pi:
 1. Type a normal prompt.
 2. Press Enter.
 3. The extension reviews it with a lightweight model.
-4. A dialog shows the review result.
-5. Choose:
-   - `Yes` to load the reviewed prompt
-   - `No` to restore the original prompt
-6. Press Enter again to send the prompt currently in the editor.
-
-## Bypasses
-
-These inputs are not reviewed:
-
-- slash commands such as `/help`
-- `!` shortcuts
-- prompts with image attachments
-
-To skip review once for a normal prompt, prefix it with a backslash:
-
-```text
-\send this directly without review
-```
+4. The reviewed prompt is loaded back into the editor.
+5. A review widget appears above the editor.
+6. Press Enter to send the reviewed prompt, or restore the original first.
 
 ## Usage
 
@@ -81,6 +67,18 @@ To skip review once for a normal prompt, prefix it with a backslash:
 ```text
 /prompt-review status
 /prompt-review help
+```
+
+### Restore the original prompt after review
+
+```text
+/prompt-review revert
+```
+
+Default shortcut:
+
+```text
+Ctrl+Alt+R
 ```
 
 ### Configure context mode
@@ -140,18 +138,57 @@ Recommended default:
 
 This is usually the best balance of speed, cost, and review quality.
 
-## What the result dialog shows
+## What the review widget shows
 
-The dialog can show:
+The widget shows:
 
-- whether context was sent
-- reviewer model
-- thinking level
-- token usage
-- cost
-- summary, notes, and clarification questions
+- a compact metadata line with context, reviewer model, thinking level, token
+  usage, and cost
+- clarification questions when the reviewer has useful follow-up questions
+- a reminder that Enter sends the reviewed prompt
+- a reminder that `/prompt-review revert` or `Ctrl+Alt+R` restores the original
+
+The widget is cleared automatically after the reviewed prompt is sent, after the
+original prompt is restored, or when the review becomes stale because the editor
+content changed.
+
+## Bypasses
+
+These inputs are not reviewed:
+
+- slash commands such as `/help`
+- `!` shortcuts
+- prompts with image attachments
+
+To skip review once for a normal prompt, prefix it with a backslash:
+
+```text
+\send this directly without review
+```
 
 ## Retry behavior
 
 If the first reviewer run returns no text, the extension retries once using the
 current session model with thinking set to `off`.
+
+## Development
+
+For local development, a simple workflow is:
+
+1. clone this repository
+2. install it into pi from the local path
+3. edit the files in this repository
+4. run `/reload` in pi to pick up changes
+
+Example:
+
+```bash
+pi install /home/rsilva/dev/pi-prompt-reviewer
+```
+
+Because local path installs are referenced directly from disk, pi reloads the
+current repo contents. No copy step is needed.
+
+## License
+
+MIT
