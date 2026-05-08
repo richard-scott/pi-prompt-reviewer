@@ -8,7 +8,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@mariozechner/pi-coding-agent";
-import { Key, type AutocompleteItem } from "@mariozechner/pi-tui";
+import { fuzzyFilter, Key, type AutocompleteItem } from "@mariozechner/pi-tui";
 
 type ReviewContextMode = "off" | "smart" | "always";
 type ReviewerThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -72,6 +72,7 @@ const DEFAULT_REVIEWER_THINKING: ReviewerThinkingLevel = "off";
 const REVIEW_STATE_ENTRY = "prompt-review:state";
 const REVIEW_WIDGET_KEY = "prompt-review";
 const REVERT_SHORTCUT_LABEL = "Ctrl+Alt+R";
+const REVIEW_CONFIG_TEST_PROMPT = "Reply with exactly OK and nothing else.";
 const MAX_CONTEXT_CHARS = 4_000;
 const AUTO_REVIEWER_MODEL_CANDIDATES = [
   "haiku",
@@ -94,6 +95,8 @@ const AUTO_REVIEWER_MODEL_CANDIDATES_BY_PROVIDER: Record<string, readonly string
 const REFERENTIAL_PROMPT_PATTERN =
   /\b(this|that|it|them|they|these|those|same|again|continue|continuing|shorter|longer|rewrite|reword|rephrase|fix|improve|refine|polish|expand|trim|condense|summari[sz]e|use the same|based on|from above|from earlier|previous|last reply|last response|response above|above)\b/i;
 
+let completionCtx: ExtensionContext | undefined;
+
 function splitArgs(input: string): string[] {
   return input.trim().split(/\s+/).filter(Boolean);
 }
@@ -110,7 +113,7 @@ function isThinkingLevel(value: string): value is ReviewerThinkingLevel {
   return THINKING_LEVEL_OPTIONS.includes(value as ReviewerThinkingLevel);
 }
 
-function getCommandCompletions(prefix: string): AutocompleteItem[] | null {
+async function getCommandCompletions(prefix: string): Promise<AutocompleteItem[] | null> {
   const trimmed = prefix.replace(/^\s+/, "");
   const hasTrailingSpace = /\s$/.test(trimmed);
   const tokens = splitArgs(trimmed);
@@ -144,9 +147,7 @@ function getCommandCompletions(prefix: string): AutocompleteItem[] | null {
   }
 
   if (tokens[0] === "model") {
-    const modelPrefix = hasTrailingSpace ? "" : (tokens[1] ?? "");
-    if (!"auto".startsWith(modelPrefix)) return null;
-    return [{ value: "model auto", label: "model auto" }];
+    return await getModelCommandCompletions(hasTrailingSpace ? "" : (tokens[1] ?? ""));
   }
 
   return null;
@@ -193,11 +194,13 @@ function buildHelpText(
     "Reviewer model selection:",
     "- model auto: prefer a lightweight available model (for example haiku, gpt-5.4-mini, mini, nano, or flash)",
     "- model <model-pattern>: choose any available model by fuzzy name or provider/id",
+    "- explicit reviewer model changes are tested before they are saved",
     "- note: the default auto-selected model may not be supported by your subscription; if review fails, pick another model with /prompt-review model <model-pattern>",
     "",
     "Reviewer thinking selection:",
     "- off is the fastest and cheapest default",
     "- higher levels may improve edge-case rewrites but cost more and can be slower",
+    "- thinking changes are tested before they are saved",
     "",
     "Bypasses:",
     "- slash commands and !bash shortcuts are not reviewed",
@@ -254,6 +257,7 @@ function buildReviewPrompt(prompt: string, context?: ReviewContext): string {
     "- If the prompt is already good, keep it nearly unchanged and use DECISION: ready.",
     "- Use DECISION: needs_clarification only when a missing detail would materially improve the result.",
     "- Always correct obvious typos and spelling mistakes in the final prompt.",
+    "- If there are no useful clarification questions, leave the QUESTIONS section empty. Do not write 'None'.",
     "- Do not mention this reviewer, subagents, or internal process inside the final prompt.",
     hasContext
       ? "- Treat any recent conversation context as reference only. Use it only to resolve referential wording in the new prompt."
@@ -282,6 +286,11 @@ function buildReviewPrompt(prompt: string, context?: ReviewContext): string {
     .join("\n");
 }
 
+function isEmptyListPlaceholder(value: string): boolean {
+  const normalized = value.trim().toLowerCase().replace(/[.?!]+$/g, "");
+  return ["none", "n/a", "na", "no questions", "no clarification questions"].includes(normalized);
+}
+
 function parseListSection(name: string, text: string): string[] {
   const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const pattern = new RegExp(
@@ -296,7 +305,7 @@ function parseListSection(name: string, text: string): string[] {
     .map((line) => line.trim())
     .filter(Boolean)
     .map((line) => line.replace(/^[-*]\s*/, "").trim())
-    .filter(Boolean);
+    .filter((line) => Boolean(line) && !isEmptyListPlaceholder(line));
 }
 
 function parseReview(text: string): ParsedReview {
@@ -492,14 +501,48 @@ type ResolvedReviewerModel = {
 async function getAvailableModels(ctx: ExtensionContext): Promise<ModelInfo[]> {
   const registry = ctx.modelRegistry as ModelRegistryLike;
   if (typeof registry.getAvailable === "function") {
-    const models = await registry.getAvailable();
-    return Array.isArray(models) ? (models as ModelInfo[]) : [];
+    const models = registry.getAvailable();
+    if (Array.isArray(models) && models.length > 0) return models as ModelInfo[];
   }
   if (typeof registry.getAll === "function") {
     const models = registry.getAll();
     return Array.isArray(models) ? (models as ModelInfo[]) : [];
   }
   return [];
+}
+
+async function getModelCommandCompletions(modelPrefix: string): Promise<AutocompleteItem[] | null> {
+  const items: AutocompleteItem[] = [{ value: "model auto", label: "model auto" }];
+  if (!completionCtx) return items;
+
+  const models = await getAvailableModels(completionCtx);
+  if (models.length === 0) return items;
+
+  const filtered = fuzzyFilter(models, modelPrefix, (model) => {
+    const canonical = toCanonicalModelId(model);
+    return `${model.id} ${model.provider} ${model.name ?? ""} ${canonical}`;
+  });
+
+  if (filtered.length === 0) return items;
+
+  const seen = new Set<string>();
+  const modelItems = filtered
+    .map((model) => {
+      const canonical = toCanonicalModelId(model);
+      const description = model.name ? `${model.provider} — ${model.name}` : model.provider;
+      return {
+        value: `model ${canonical}`,
+        label: model.id,
+        description,
+      } satisfies AutocompleteItem;
+    })
+    .filter((item) => {
+      if (seen.has(item.value)) return false;
+      seen.add(item.value);
+      return true;
+    });
+
+  return [...items, ...modelItems];
 }
 
 function scoreModelMatch(query: string, model: ModelInfo): number {
@@ -598,6 +641,17 @@ function formatModelLabel(model: { name?: string; provider?: string; id?: string
   if (model.name) return model.name;
   if (model.provider && model.id) return `${model.provider}/${model.id}`;
   return model.id ?? "current session model";
+}
+
+async function testReviewerConfiguration(
+  ctx: ExtensionContext,
+  model: Model<any> | undefined,
+  thinking: ReviewerThinkingLevel,
+): Promise<void> {
+  const result = await runReviewSession(ctx, REVIEW_CONFIG_TEST_PROMPT, model, thinking);
+  if (!result.resultText.trim()) {
+    throw new Error("reviewer test returned no text");
+  }
 }
 
 function readState(ctx: ExtensionContext): ReviewState {
@@ -824,6 +878,7 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     currentCtx = ctx;
+    completionCtx = ctx;
     approvedPrompt = undefined;
     activeReview = undefined;
     reviewInFlight = false;
@@ -838,6 +893,7 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    completionCtx = undefined;
     approvedPrompt = undefined;
     activeReview = undefined;
     reviewInFlight = false;
@@ -851,6 +907,7 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
     getArgumentCompletions: (prefix) => getCommandCompletions(prefix),
     handler: async (args, ctx) => {
       currentCtx = ctx;
+      completionCtx = ctx;
       const tokens = splitArgs(args);
       const [action, value, ...rest] = tokens;
 
@@ -962,6 +1019,22 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
           return;
         }
 
+        const previousReviewerModel = reviewerModel;
+        const effectiveReviewerThinking = normalizeReviewerThinking(reviewerThinking, resolvedModel);
+
+        try {
+          await testReviewerConfiguration(ctx, resolvedModel.model as Model<any> | undefined, effectiveReviewerThinking);
+        } catch (error) {
+          const previousLabel = previousReviewerModel ?? "auto";
+          const message = `Prompt reviewer model test failed for ${toCanonicalModelId(resolvedModel.info)} (thinking: ${effectiveReviewerThinking}): ${error instanceof Error ? error.message : String(error)}. Keeping current reviewer model: ${previousLabel}.`;
+          if (ctx.hasUI) {
+            ctx.ui.notify(message, "warning");
+          } else {
+            process.stderr.write(`${message}\n`);
+          }
+          return;
+        }
+
         reviewerModel = toCanonicalModelId(resolvedModel.info);
         persistState(pi, { enabled, contextMode, reviewerModel, reviewerThinking });
 
@@ -1005,7 +1078,33 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
           return;
         }
 
-        reviewerThinking = normalizeCommand(value) as ReviewerThinkingLevel;
+        const requestedReviewerThinking = normalizeCommand(value) as ReviewerThinkingLevel;
+        const previousReviewerThinking = reviewerThinking;
+        const resolvedReviewerModel = await resolveReviewerModel(ctx, reviewerModel);
+        const effectiveReviewerThinking = normalizeReviewerThinking(requestedReviewerThinking, resolvedReviewerModel);
+
+        try {
+          await testReviewerConfiguration(
+            ctx,
+            resolvedReviewerModel?.model as Model<any> | undefined,
+            effectiveReviewerThinking,
+          );
+        } catch (error) {
+          const modelLabel = formatModelLabel(
+            (resolvedReviewerModel?.info as { name?: string; provider?: string; id?: string } | undefined)
+              ?? (resolvedReviewerModel?.model as { name?: string; provider?: string; id?: string } | undefined)
+              ?? ctx.model,
+          );
+          const message = `Prompt reviewer thinking test failed for ${modelLabel} (thinking: ${effectiveReviewerThinking}): ${error instanceof Error ? error.message : String(error)}. Keeping current reviewer thinking: ${previousReviewerThinking}.`;
+          if (ctx.hasUI) {
+            ctx.ui.notify(message, "warning");
+          } else {
+            process.stderr.write(`${message}\n`);
+          }
+          return;
+        }
+
+        reviewerThinking = requestedReviewerThinking;
         persistState(pi, { enabled, contextMode, reviewerModel, reviewerThinking });
 
         const message = buildThinkingText(reviewerThinking);
@@ -1084,6 +1183,7 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
 
   pi.on("input", async (event, ctx) => {
     currentCtx = ctx;
+    completionCtx = ctx;
 
     if (!ctx.hasUI) return { action: "continue" };
     if (!enabled) return { action: "continue" };
