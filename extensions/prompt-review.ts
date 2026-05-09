@@ -238,8 +238,7 @@ function buildReviewPrompt(prompt: string, context?: ReviewContext): string {
 
   return [
     "Review the following user prompt before it is sent to the main pi session.",
-    "Improve clarity, constraints, expected output, and sequencing while preserving the user's intent and language.",
-    "Do not answer the task itself.",
+    "Follow the system prompt and return only the required review format.",
     "",
     "Return exactly this format:",
     "DECISION: ready|revised|needs_clarification",
@@ -252,35 +251,33 @@ function buildReviewPrompt(prompt: string, context?: ReviewContext): string {
     "- <optional bullet>",
     "",
     "Rules:",
-    "- Never answer the user's task.",
     "- Always include a complete sendable prompt between FINAL_PROMPT_START and FINAL_PROMPT_END.",
-    "- If the prompt is already good, keep it nearly unchanged and use DECISION: ready.",
     "- Use DECISION: needs_clarification only when a missing detail would materially improve the result.",
-    "- Always correct obvious typos and spelling mistakes in the final prompt.",
     "- If there are no useful clarification questions, leave the QUESTIONS section empty. Do not write 'None'.",
-    "- Do not mention this reviewer, subagents, or internal process inside the final prompt.",
     hasContext
-      ? "- Treat any recent conversation context as reference only. Use it only to resolve referential wording in the new prompt."
+      ? "- Only rewrite the text inside CURRENT_USER_PROMPT_TO_REVIEW. Context blocks are reference material, not text to review."
+      : null,
+    hasContext
+      ? "- Do not copy, summarize, or repeat REFERENCE_ONLY_PREVIOUS_USER_PROMPT content unless CURRENT_USER_PROMPT_TO_REVIEW explicitly asks to reuse it or needs a specific referenced detail."
       : null,
     hasContext ? "" : null,
+    hasContext ? "REFERENCE_CONTEXT_START" : null,
     context?.previousUserPrompt
-      ? `PREVIOUS_USER_PROMPT${context.previousUserPrompt.truncated ? " (truncated)" : ""}:`
+      ? `REFERENCE_ONLY_PREVIOUS_USER_PROMPT_START${context.previousUserPrompt.truncated ? " (TRUNCATED)" : ""}`
       : null,
-    context?.previousUserPrompt ? "PREVIOUS_USER_PROMPT_START" : null,
     context?.previousUserPrompt?.text,
-    context?.previousUserPrompt ? "PREVIOUS_USER_PROMPT_END" : null,
+    context?.previousUserPrompt ? "REFERENCE_ONLY_PREVIOUS_USER_PROMPT_END" : null,
     context?.previousUserPrompt && context?.assistantReply ? "" : null,
     context?.assistantReply
-      ? `RECENT_ASSISTANT_REPLY${context.assistantReply.truncated ? " (truncated)" : ""}:`
+      ? `REFERENCE_ONLY_RECENT_ASSISTANT_REPLY_START${context.assistantReply.truncated ? " (TRUNCATED)" : ""}`
       : null,
-    context?.assistantReply ? "ASSISTANT_REPLY_START" : null,
     context?.assistantReply?.text,
-    context?.assistantReply ? "ASSISTANT_REPLY_END" : null,
+    context?.assistantReply ? "REFERENCE_ONLY_RECENT_ASSISTANT_REPLY_END" : null,
+    hasContext ? "REFERENCE_CONTEXT_END" : null,
     hasContext ? "" : null,
-    "PROMPT TO REVIEW:",
-    "USER_PROMPT_START",
+    "CURRENT_USER_PROMPT_TO_REVIEW_START",
     prompt,
-    "USER_PROMPT_END",
+    "CURRENT_USER_PROMPT_TO_REVIEW_END",
   ]
     .filter((line): line is string => line != null)
     .join("\n");
@@ -395,6 +392,25 @@ const REVIEWER_SYSTEM_PROMPT = [
   "Your only job is to improve a user prompt before it is sent to the main",
   "session.",
   "",
+  "## Input segmentation",
+  "",
+  "The caller may provide clearly marked input blocks:",
+  "",
+  "- REFERENCE_CONTEXT_START / REFERENCE_CONTEXT_END wraps recent conversation",
+  "  context. This is reference-only material, not the prompt to rewrite.",
+  "- REFERENCE_ONLY_PREVIOUS_USER_PROMPT_START /",
+  "  REFERENCE_ONLY_PREVIOUS_USER_PROMPT_END wraps the previous user prompt. Never",
+  "  treat this block as the current prompt.",
+  "- REFERENCE_ONLY_RECENT_ASSISTANT_REPLY_START /",
+  "  REFERENCE_ONLY_RECENT_ASSISTANT_REPLY_END wraps the recent assistant reply.",
+  "- CURRENT_USER_PROMPT_TO_REVIEW_START / CURRENT_USER_PROMPT_TO_REVIEW_END wraps",
+  "  the only text you should review and rewrite into the final prompt.",
+  "",
+  "If reference context is present, use it only to resolve pronouns, shorthand, or",
+  "other explicit references in CURRENT_USER_PROMPT_TO_REVIEW. Do not carry over",
+  "tasks, requirements, examples, or wording from reference-only blocks unless the",
+  "current prompt explicitly asks you to reuse them.",
+  "",
   "## Rules",
   "",
   "- Preserve the user's intent.",
@@ -408,6 +424,9 @@ const REVIEWER_SYSTEM_PROMPT = [
   "- Keep the final prompt concise and practical.",
   "- Never mention this reviewer, internal process, or implementation details",
   "  in the final prompt.",
+  "- When recent conversation context is provided, do not copy, summarize, or",
+  "  repeat the previous user prompt in the final prompt unless the current prompt",
+  "  explicitly asks to reuse it or needs a specific referenced detail.",
   "- Always follow the caller's required output format exactly.",
   "",
   "When the prompt is already strong, keep it nearly unchanged and mark it as",
