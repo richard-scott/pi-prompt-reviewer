@@ -1,6 +1,6 @@
 {
   "name": "pi-prompt-reviewer",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Review prompts before sending them to the main pi session.",
   "keywords": ["pi-package", "pi", "extension", "prompt-review", "reviewer", "prompt"],
   "author": "surfdude75",

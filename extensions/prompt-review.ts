@@ -10,12 +10,13 @@ import {
 } from "@mariozechner/pi-coding-agent";
 import { fuzzyFilter, Key, type AutocompleteItem } from "@mariozechner/pi-tui";
 
-type ReviewContextMode = "off" | "smart" | "always";
+type ReviewContextMode = "off" | "always";
 type ReviewerThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
 type ReviewState = {
   enabled: boolean;
   contextMode: ReviewContextMode;
+  targetLanguage: string;
   reviewerModel?: string;
   reviewerThinking: ReviewerThinkingLevel;
 };
@@ -23,6 +24,7 @@ type ReviewState = {
 type PendingReview = {
   originalText: string;
   contextLabel: string;
+  targetLanguage: string;
   reviewerModelLabel: string;
   reviewerThinking: ReviewerThinkingLevel;
   reviewContext?: ReviewContext;
@@ -64,11 +66,32 @@ type ActiveReview = {
   reviewedText: string;
 };
 
-const ROOT_COMMAND_OPTIONS = ["on", "off", "toggle", "status", "help", "context", "model", "thinking", "revert"] as const;
-const CONTEXT_MODE_OPTIONS = ["off", "smart", "always"] as const;
+const ROOT_COMMAND_OPTIONS = ["on", "off", "toggle", "status", "help", "context", "language", "model", "thinking", "revert"] as const;
+const CONTEXT_MODE_OPTIONS = ["off", "always"] as const;
 const THINKING_LEVEL_OPTIONS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
-const DEFAULT_CONTEXT_MODE: ReviewContextMode = "smart";
+const DEFAULT_CONTEXT_MODE: ReviewContextMode = "always";
+const DEFAULT_TARGET_LANGUAGE = "match input";
 const DEFAULT_REVIEWER_THINKING: ReviewerThinkingLevel = "off";
+const TARGET_LANGUAGE_OPTIONS = [
+  DEFAULT_TARGET_LANGUAGE,
+  "English",
+  "Spanish",
+  "French",
+  "German",
+  "Italian",
+  "Portuguese",
+  "Brazilian Portuguese",
+  "Japanese",
+  "Korean",
+  "Chinese",
+  "Dutch",
+  "Polish",
+  "Russian",
+  "Ukrainian",
+  "Arabic",
+  "Hindi",
+] as const;
+const TARGET_LANGUAGE_MATCH_INPUT_ALIASES = new Set(["match input", "match-input", "match", "input", "auto"]);
 const REVIEW_STATE_ENTRY = "prompt-review:state";
 const REVIEW_WIDGET_KEY = "prompt-review";
 const REVERT_SHORTCUT_LABEL = "Ctrl+Alt+R";
@@ -92,9 +115,6 @@ const AUTO_REVIEWER_MODEL_CANDIDATES_BY_PROVIDER: Record<string, readonly string
   "openai-codex": ["gpt-5.4-mini", "gpt-5-mini", "gpt-5-nano", "gpt-4.1-mini"],
   google: ["gemini-2.5-flash", "gemini-flash", "flash"],
 };
-const REFERENTIAL_PROMPT_PATTERN =
-  /\b(this|that|it|them|they|these|those|same|again|continue|continuing|shorter|longer|rewrite|reword|rephrase|fix|improve|refine|polish|expand|trim|condense|summari[sz]e|use the same|based on|from above|from earlier|previous|last reply|last response|response above|above)\b/i;
-
 let completionCtx: ExtensionContext | undefined;
 
 function splitArgs(input: string): string[] {
@@ -113,6 +133,35 @@ function isThinkingLevel(value: string): value is ReviewerThinkingLevel {
   return THINKING_LEVEL_OPTIONS.includes(value as ReviewerThinkingLevel);
 }
 
+function normalizeTargetLanguage(value: string): string {
+  const normalized = value.trim().replace(/\s+/g, " ");
+  if (!normalized) return DEFAULT_TARGET_LANGUAGE;
+  if (TARGET_LANGUAGE_MATCH_INPUT_ALIASES.has(normalized.toLowerCase())) return DEFAULT_TARGET_LANGUAGE;
+
+  const knownLanguage = TARGET_LANGUAGE_OPTIONS.find(
+    (language) => language.toLowerCase() === normalized.toLowerCase(),
+  );
+  return knownLanguage ?? normalized;
+}
+
+function isMatchInputTargetLanguage(targetLanguage: string): boolean {
+  return normalizeTargetLanguage(targetLanguage) === DEFAULT_TARGET_LANGUAGE;
+}
+
+function getTargetLanguageCompletions(languagePrefix: string): AutocompleteItem[] | null {
+  const prefix = languagePrefix.trim();
+  const filtered = prefix
+    ? fuzzyFilter([...TARGET_LANGUAGE_OPTIONS], prefix, (language) => language)
+    : [...TARGET_LANGUAGE_OPTIONS];
+
+  if (filtered.length === 0) return null;
+
+  return filtered.map((language) => ({
+    value: `language ${language}`,
+    label: `language ${language}`,
+  }));
+}
+
 async function getCommandCompletions(prefix: string): Promise<AutocompleteItem[] | null> {
   const trimmed = prefix.replace(/^\s+/, "");
   const hasTrailingSpace = /\s$/.test(trimmed);
@@ -126,6 +175,10 @@ async function getCommandCompletions(prefix: string): Promise<AutocompleteItem[]
     const values = ROOT_COMMAND_OPTIONS.filter((value) => value.startsWith(tokens[0]!));
     if (values.length === 0) return null;
     return values.map((value) => ({ value, label: value }));
+  }
+
+  if (tokens[0] === "language") {
+    return getTargetLanguageCompletions(hasTrailingSpace ? "" : tokens.slice(1).join(" "));
   }
 
   if (tokens.length > 2) return null;
@@ -156,6 +209,7 @@ async function getCommandCompletions(prefix: string): Promise<AutocompleteItem[]
 function buildHelpText(
   enabled: boolean,
   contextMode: ReviewContextMode,
+  targetLanguage: string,
   reviewerModel: string | undefined,
   reviewerThinking: ReviewerThinkingLevel,
 ): string {
@@ -166,7 +220,9 @@ function buildHelpText(
     "  /prompt-review toggle",
     "  /prompt-review status",
     "  /prompt-review context",
-    "  /prompt-review context off|smart|always",
+    "  /prompt-review context off|always",
+    "  /prompt-review language",
+    "  /prompt-review language match input|<language>",
     "  /prompt-review model",
     "  /prompt-review model auto",
     "  /prompt-review model <model-pattern>",
@@ -176,6 +232,7 @@ function buildHelpText(
     "",
     `Current mode: ${enabled ? "enabled" : "disabled"}`,
     `Current context mode: ${contextMode}`,
+    `Current target language: ${targetLanguage}`,
     `Current reviewer model: ${reviewerModel ?? "auto"}`,
     `Current reviewer thinking: ${reviewerThinking}`,
     "",
@@ -188,8 +245,11 @@ function buildHelpText(
     "",
     "Context modes:",
     "- off: do not send recent conversation context",
-    "- smart: send the previous user prompt and last assistant reply only for referential follow-ups",
     "- always: always send the previous user prompt and last assistant reply when they exist",
+    "",
+    "Target language:",
+    "- language match input: write the reviewed prompt in the input prompt's language",
+    "- language <language>: write the reviewed prompt in that language, translating as needed",
     "",
     "Reviewer model selection:",
     "- model auto: prefer a lightweight available model (for example haiku, gpt-5.4-mini, mini, nano, or flash)",
@@ -215,14 +275,19 @@ function buildHelpText(
 function buildStatusText(
   enabled: boolean,
   contextMode: ReviewContextMode,
+  targetLanguage: string,
   reviewerModel: string | undefined,
   reviewerThinking: ReviewerThinkingLevel,
 ): string {
-  return `prompt review: ${enabled ? "enabled" : "disabled"} (context: ${contextMode}, model: ${reviewerModel ?? "auto"}, thinking: ${reviewerThinking})`;
+  return `prompt review: ${enabled ? "enabled" : "disabled"} (context: ${contextMode}, language: ${targetLanguage}, model: ${reviewerModel ?? "auto"}, thinking: ${reviewerThinking})`;
 }
 
 function buildContextModeText(contextMode: ReviewContextMode): string {
   return `prompt review context: ${contextMode}`;
+}
+
+function buildTargetLanguageText(targetLanguage: string): string {
+  return `prompt review target language: ${targetLanguage}`;
 }
 
 function buildModelText(reviewerModel: string | undefined): string {
@@ -233,12 +298,23 @@ function buildThinkingText(reviewerThinking: ReviewerThinkingLevel): string {
   return `prompt review thinking: ${reviewerThinking}`;
 }
 
-function buildReviewPrompt(prompt: string, context?: ReviewContext): string {
+function buildReviewPrompt(prompt: string, targetLanguage: string, context?: ReviewContext): string {
   const hasContext = Boolean(context?.previousUserPrompt || context?.assistantReply);
+  const isMatchInputLanguage = isMatchInputTargetLanguage(targetLanguage);
+  const languageRule = isMatchInputLanguage
+    ? "- TARGET_LANGUAGE is match input: write FINAL_PROMPT content and any clarification question text in the same language as CURRENT_USER_PROMPT_TO_REVIEW. If the input mixes languages, use the primary input language."
+    : `- TARGET_LANGUAGE is ${targetLanguage}: you MUST translate FINAL_PROMPT content and any clarification question text into ${targetLanguage}. Do not leave FINAL_PROMPT in the source language unless the source language is already ${targetLanguage}.`;
 
   return [
     "Review the following user prompt before it is sent to the main pi session.",
     "Follow the system prompt and return only the required review format.",
+    "",
+    "TARGET_LANGUAGE:",
+    targetLanguage,
+    isMatchInputLanguage
+      ? "The final prompt should match the input language."
+      : `The final prompt must be written in ${targetLanguage}, translating the user's request as needed while preserving intent.`,
+    "Treat TARGET_LANGUAGE as a hard requirement, not a suggestion.",
     "",
     "Return exactly this format:",
     "DECISION: ready|revised|needs_clarification",
@@ -252,6 +328,8 @@ function buildReviewPrompt(prompt: string, context?: ReviewContext): string {
     "",
     "Rules:",
     "- Always include a complete sendable prompt between FINAL_PROMPT_START and FINAL_PROMPT_END.",
+    "- Keep required labels such as DECISION, FINAL_PROMPT_START, FINAL_PROMPT_END, and QUESTIONS in English exactly as specified.",
+    languageRule,
     "- Use DECISION: needs_clarification only when a missing detail would materially improve the result.",
     "- If there are no useful clarification questions, leave the QUESTIONS section empty. Do not write 'None'.",
     hasContext
@@ -343,6 +421,7 @@ function formatReviewWidgetLines(
   review: ParsedReview,
   changed: boolean,
   contextLabel: string,
+  targetLanguage: string,
   reviewerModelLabel: string,
   reviewerThinking: ReviewerThinkingLevel,
   tokens: TokenUsage | undefined,
@@ -350,6 +429,7 @@ function formatReviewWidgetLines(
 ): string[] {
   const metadataParts = [
     `context: ${contextLabel}`,
+    `language: ${targetLanguage}`,
     `reviewer: ${reviewerModelLabel}`,
     `thinking: ${reviewerThinking}`,
   ];
@@ -414,8 +494,10 @@ const REVIEWER_SYSTEM_PROMPT = [
   "## Rules",
   "",
   "- Preserve the user's intent.",
-  "- Preserve the user's language and tone unless clarity requires a small",
-  "  change.",
+  "- Preserve the user's tone unless clarity requires a small change.",
+  "- If the caller gives a target language instruction, it overrides the source",
+  "  language. Translate the final prompt and questions into that target language.",
+  "- If the caller asks to match the input language, preserve the input language.",
   "- Do not answer the task itself.",
   "- Do not add extra goals the user did not ask for.",
   "- Improve clarity, sequencing, constraints, expected output, and missing",
@@ -428,9 +510,11 @@ const REVIEWER_SYSTEM_PROMPT = [
   "  repeat the previous user prompt in the final prompt unless the current prompt",
   "  explicitly asks to reuse it or needs a specific referenced detail.",
   "- Always follow the caller's required output format exactly.",
+  "- Keep machine-readable section labels in the requested format even when",
+  "  translating human-readable content.",
   "",
   "When the prompt is already strong, keep it nearly unchanged and mark it as",
-  "ready.",
+  "ready, but still translate it when an explicit target language is provided.",
   "When important ambiguity remains, provide the best sendable draft you can",
   "and note the missing details.",
 ].join("\n");
@@ -677,6 +761,7 @@ function readState(ctx: ExtensionContext): ReviewState {
   let state: ReviewState = {
     enabled: true,
     contextMode: DEFAULT_CONTEXT_MODE,
+    targetLanguage: DEFAULT_TARGET_LANGUAGE,
     reviewerModel: undefined,
     reviewerThinking: DEFAULT_REVIEWER_THINKING,
   };
@@ -696,6 +781,9 @@ function readState(ctx: ExtensionContext): ReviewState {
     if (typeof data?.contextMode === "string" && isContextMode(data.contextMode)) {
       state = { ...state, contextMode: data.contextMode };
     }
+    if (typeof data?.targetLanguage === "string" && data.targetLanguage.trim()) {
+      state = { ...state, targetLanguage: normalizeTargetLanguage(data.targetLanguage) };
+    }
     if (typeof data?.reviewerModel === "string" && data.reviewerModel.trim()) {
       state = {
         ...state,
@@ -713,6 +801,7 @@ function readState(ctx: ExtensionContext): ReviewState {
 function persistState(pi: ExtensionAPI, state: ReviewState): void {
   pi.appendEntry(REVIEW_STATE_ENTRY, {
     ...state,
+    targetLanguage: normalizeTargetLanguage(state.targetLanguage),
     reviewerModel: state.reviewerModel ?? "auto",
   });
 }
@@ -721,20 +810,23 @@ function updateStatus(
   ctx: ExtensionContext | undefined,
   enabled: boolean,
   contextMode: ReviewContextMode,
+  targetLanguage: string,
   busy: boolean,
 ): void {
   if (!ctx?.hasUI) return;
 
+  const languageSuffix = isMatchInputTargetLanguage(targetLanguage) ? "" : `/${targetLanguage}`;
+
   if (busy) {
-    ctx.ui.setStatus("prompt-review", ctx.ui.theme.fg("warning", `PR:reviewing/${contextMode}`));
+    ctx.ui.setStatus("prompt-review", ctx.ui.theme.fg("warning", `PR:reviewing/${contextMode}${languageSuffix}`));
     return;
   }
 
   ctx.ui.setStatus(
     "prompt-review",
     enabled
-      ? ctx.ui.theme.fg("accent", `PR:on/${contextMode}`)
-      : ctx.ui.theme.fg("dim", `PR:off/${contextMode}`),
+      ? ctx.ui.theme.fg("accent", `PR:on/${contextMode}${languageSuffix}`)
+      : ctx.ui.theme.fg("dim", `PR:off/${contextMode}${languageSuffix}`),
   );
 }
 
@@ -774,10 +866,6 @@ function findLastMessageByRole(
   return undefined;
 }
 
-function shouldIncludeAssistantContext(prompt: string): boolean {
-  return REFERENTIAL_PROMPT_PATTERN.test(prompt.trim());
-}
-
 function toContextBlock(text: string): ContextBlock {
   if (text.length <= MAX_CONTEXT_CHARS) {
     return {
@@ -798,7 +886,6 @@ function getReviewContext(
   contextMode: ReviewContextMode,
 ): ReviewContext | undefined {
   if (contextMode === "off") return undefined;
-  if (contextMode === "smart" && !shouldIncludeAssistantContext(prompt)) return undefined;
 
   const previousUserPrompt = findLastMessageByRole(ctx, "user");
   const assistantReply = findLastMessageByRole(ctx, "assistant");
@@ -821,6 +908,7 @@ function getContextLabel(context: ReviewContext | undefined): string {
 export default function promptReviewExtension(pi: ExtensionAPI) {
   let enabled = true;
   let contextMode: ReviewContextMode = DEFAULT_CONTEXT_MODE;
+  let targetLanguage = DEFAULT_TARGET_LANGUAGE;
   let reviewerModel: string | undefined;
   let reviewerThinking: ReviewerThinkingLevel = DEFAULT_REVIEWER_THINKING;
   let approvedPrompt: string | undefined;
@@ -840,7 +928,7 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
     approvedPrompt = text;
     currentCtx.ui.setEditorText(text);
     currentCtx.ui.notify(message, "info");
-    updateStatus(currentCtx, enabled, contextMode, reviewInFlight);
+    updateStatus(currentCtx, enabled, contextMode, targetLanguage, reviewInFlight);
   };
 
   const revertActiveReview = (ctx: ExtensionContext) => {
@@ -862,6 +950,7 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
     review: ParsedReview,
     changed: boolean,
     contextLabel: string,
+    targetLanguage: string,
     reviewerModelLabel: string,
     reviewerThinking: ReviewerThinkingLevel,
     tokens: TokenUsage | undefined,
@@ -873,6 +962,7 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
       review,
       changed,
       contextLabel,
+      targetLanguage,
       reviewerModelLabel,
       reviewerThinking,
       tokens,
@@ -892,7 +982,12 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
     model: Model<any> | undefined,
     thinking: ReviewerThinkingLevel,
   ): Promise<ReviewRunResult> => {
-    return await runReviewSession(ctx, buildReviewPrompt(pending.originalText, pending.reviewContext), model, thinking);
+    return await runReviewSession(
+      ctx,
+      buildReviewPrompt(pending.originalText, pending.targetLanguage, pending.reviewContext),
+      model,
+      thinking,
+    );
   };
 
   pi.on("session_start", async (_event, ctx) => {
@@ -906,9 +1001,10 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
     const state = readState(ctx);
     enabled = state.enabled;
     contextMode = state.contextMode;
+    targetLanguage = state.targetLanguage;
     reviewerModel = state.reviewerModel;
     reviewerThinking = state.reviewerThinking;
-    updateStatus(ctx, enabled, contextMode, false);
+    updateStatus(ctx, enabled, contextMode, targetLanguage, false);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
@@ -922,7 +1018,7 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("prompt-review", {
-    description: "Toggle prompt review and configure reviewer context, model, and thinking",
+    description: "Toggle prompt review and configure reviewer context, language, model, and thinking",
     getArgumentCompletions: (prefix) => getCommandCompletions(prefix),
     handler: async (args, ctx) => {
       currentCtx = ctx;
@@ -931,7 +1027,7 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
       const [action, value, ...rest] = tokens;
 
       if (!action || action === "status") {
-        const message = buildStatusText(enabled, contextMode, reviewerModel, reviewerThinking);
+        const message = buildStatusText(enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking);
         if (ctx.hasUI) {
           ctx.ui.notify(message, "info");
         } else {
@@ -941,7 +1037,7 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
       }
 
       if (action === "help") {
-        const helpText = buildHelpText(enabled, contextMode, reviewerModel, reviewerThinking);
+        const helpText = buildHelpText(enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking);
         if (ctx.hasUI) {
           await ctx.ui.confirm("Prompt review help", helpText);
         } else {
@@ -982,10 +1078,36 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
         }
 
         contextMode = normalizeCommand(value) as ReviewContextMode;
-        persistState(pi, { enabled, contextMode, reviewerModel, reviewerThinking });
-        updateStatus(ctx, enabled, contextMode, reviewInFlight);
+        persistState(pi, { enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking });
+        updateStatus(ctx, enabled, contextMode, targetLanguage, reviewInFlight);
 
         const message = buildContextModeText(contextMode);
+        if (ctx.hasUI) {
+          ctx.ui.notify(message, "info");
+        } else {
+          process.stdout.write(`${message}\n`);
+        }
+        return;
+      }
+
+      if (action === "language") {
+        const requestedLanguage = normalizeTargetLanguage([value, ...rest].filter(Boolean).join(" "));
+
+        if (!value) {
+          const message = buildTargetLanguageText(targetLanguage);
+          if (ctx.hasUI) {
+            ctx.ui.notify(message, "info");
+          } else {
+            process.stdout.write(`${message}\n`);
+          }
+          return;
+        }
+
+        targetLanguage = requestedLanguage;
+        persistState(pi, { enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking });
+        updateStatus(ctx, enabled, contextMode, targetLanguage, reviewInFlight);
+
+        const message = buildTargetLanguageText(targetLanguage);
         if (ctx.hasUI) {
           ctx.ui.notify(message, "info");
         } else {
@@ -1017,7 +1139,7 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
 
         if (normalizeCommand(value) === "auto") {
           reviewerModel = undefined;
-          persistState(pi, { enabled, contextMode, reviewerModel, reviewerThinking });
+          persistState(pi, { enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking });
           const message = buildModelText(reviewerModel);
           if (ctx.hasUI) {
             ctx.ui.notify(message, "info");
@@ -1055,7 +1177,7 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
         }
 
         reviewerModel = toCanonicalModelId(resolvedModel.info);
-        persistState(pi, { enabled, contextMode, reviewerModel, reviewerThinking });
+        persistState(pi, { enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking });
 
         const message = buildModelText(reviewerModel);
         if (ctx.hasUI) {
@@ -1124,7 +1246,7 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
         }
 
         reviewerThinking = requestedReviewerThinking;
-        persistState(pi, { enabled, contextMode, reviewerModel, reviewerThinking });
+        persistState(pi, { enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking });
 
         const message = buildThinkingText(reviewerThinking);
         if (ctx.hasUI) {
@@ -1181,10 +1303,10 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
         activeReview = undefined;
         clearReviewWidget(ctx);
       }
-      persistState(pi, { enabled, contextMode, reviewerModel, reviewerThinking });
-      updateStatus(ctx, enabled, contextMode, reviewInFlight);
+      persistState(pi, { enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking });
+      updateStatus(ctx, enabled, contextMode, targetLanguage, reviewInFlight);
 
-      const message = buildStatusText(enabled, contextMode, reviewerModel, reviewerThinking);
+      const message = buildStatusText(enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking);
       if (ctx.hasUI) {
         ctx.ui.notify(message, "info");
       } else {
@@ -1251,6 +1373,7 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
     const pending: PendingReview = {
       originalText: event.text,
       contextLabel: getContextLabel(reviewContext),
+      targetLanguage,
       reviewerModelLabel: formatModelLabel(reviewerModelMeta),
       reviewerThinking: effectiveReviewerThinking,
       reviewContext,
@@ -1259,7 +1382,7 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
 
     approvedPrompt = undefined;
     reviewInFlight = true;
-    updateStatus(ctx, enabled, contextMode, true);
+    updateStatus(ctx, enabled, contextMode, targetLanguage, true);
     ctx.ui.notify(
       reviewContext ? "Reviewing prompt with recent conversation context…" : "Reviewing prompt…",
       "info",
@@ -1270,7 +1393,7 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
       reviewRun = await runPromptReview(ctx, pending, resolvedReviewerModel?.model as Model<any> | undefined, effectiveReviewerThinking);
     } catch (error) {
       reviewInFlight = false;
-      updateStatus(ctx, enabled, contextMode, false);
+      updateStatus(ctx, enabled, contextMode, targetLanguage, false);
       restorePromptToEditor(
         pending.originalText,
         `Prompt review failed with ${pending.reviewerModelLabel} (thinking: ${pending.reviewerThinking}): ${error instanceof Error ? error.message : String(error)}. Original prompt restored. Press Enter again to send it.`,
@@ -1281,7 +1404,7 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
     if (!reviewRun.resultText) {
       if (!currentCtx?.model) {
         reviewInFlight = false;
-        updateStatus(ctx, enabled, contextMode, false);
+        updateStatus(ctx, enabled, contextMode, targetLanguage, false);
         restorePromptToEditor(
           pending.originalText,
           `Prompt review failed with ${pending.reviewerModelLabel} (thinking: ${pending.reviewerThinking}): no result was returned by the reviewer. Original prompt restored. Press Enter again to send it.`,
@@ -1307,7 +1430,7 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
         pending.reviewerThinking = retryPending.reviewerThinking;
       } catch (error) {
         reviewInFlight = false;
-        updateStatus(ctx, enabled, contextMode, false);
+        updateStatus(ctx, enabled, contextMode, targetLanguage, false);
         restorePromptToEditor(
           pending.originalText,
           `Prompt review failed with ${retryPending.reviewerModelLabel} (thinking: ${retryPending.reviewerThinking}): ${error instanceof Error ? error.message : String(error)}. Original prompt restored. Press Enter again to send it.`,
@@ -1317,7 +1440,7 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
 
       if (!reviewRun.resultText) {
         reviewInFlight = false;
-        updateStatus(ctx, enabled, contextMode, false);
+        updateStatus(ctx, enabled, contextMode, targetLanguage, false);
         restorePromptToEditor(
           pending.originalText,
           `Prompt review failed with ${pending.reviewerModelLabel} (thinking: ${pending.reviewerThinking}): no result was returned by the reviewer. Original prompt restored. Press Enter again to send it.`,
@@ -1327,7 +1450,7 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
     }
 
     reviewInFlight = false;
-    updateStatus(ctx, enabled, contextMode, false);
+    updateStatus(ctx, enabled, contextMode, targetLanguage, false);
 
     const review = parseReview(reviewRun.resultText);
     const candidatePrompt = review.prompt || pending.originalText;
@@ -1344,6 +1467,7 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
       review,
       changed,
       pending.contextLabel,
+      pending.targetLanguage,
       pending.reviewerModelLabel,
       pending.reviewerThinking,
       reviewRun.tokens,
@@ -1353,7 +1477,7 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
       `Reviewed prompt loaded. Press Enter to send it, or use /prompt-review revert or ${REVERT_SHORTCUT_LABEL} to restore the original.`,
       "info",
     );
-    updateStatus(ctx, enabled, contextMode, false);
+    updateStatus(ctx, enabled, contextMode, targetLanguage, false);
 
     return { action: "handled" };
   });

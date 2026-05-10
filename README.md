@@ -18,7 +18,7 @@ prompt before it is sent to the main session.
 - intercepts normal prompts before they are sent
 - rewrites prompts for clarity while preserving intent
 - can include recent conversation context when useful
-- lets you choose the reviewer model and thinking level
+- lets you choose the target language, reviewer model, and thinking level
 - loads the reviewed prompt back into the editor automatically
 - lets you restore the original prompt with a command or shortcut
 - displays token usage and cost for the review step
@@ -92,17 +92,27 @@ Ctrl+Alt+R
 ```text
 /prompt-review context
 /prompt-review context off
-/prompt-review context smart
 /prompt-review context always
 ```
 
 Context modes:
 
 - `off`: do not send recent conversation context
-- `smart`: send the previous user prompt and last assistant reply only for
-  referential follow-ups
 - `always`: always send the previous user prompt and last assistant reply when
   they exist
+
+### Configure target language
+
+```text
+/prompt-review language
+/prompt-review language match input
+/prompt-review language English
+/prompt-review language Brazilian Portuguese
+```
+
+The default is `match input`, which keeps the reviewed prompt in the same
+language as your input prompt. Set a specific language to have the reviewer
+translate the reviewed prompt as needed.
 
 ### Configure reviewer model
 
