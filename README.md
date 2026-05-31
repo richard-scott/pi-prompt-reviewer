@@ -20,6 +20,7 @@ prompt before it is sent to the main session.
 - can include recent conversation context when useful
 - lets you choose the target language, reviewer model, and thinking level
 - loads the reviewed prompt back into the editor automatically
+- lets you submit immediately without review via `Ctrl+S`
 - lets you restore the original prompt with a command or shortcut
 - displays token usage and cost for the review step
 
@@ -42,7 +43,8 @@ After installing or editing the extension, reload pi:
 3. The extension reviews it with a lightweight model.
 4. The reviewed prompt is loaded back into the editor.
 5. A review widget appears above the editor.
-6. Press Enter to send the reviewed prompt, or restore the original first.
+6. Press Enter to send the reviewed prompt, restore the original first, or press
+   Ctrl+S to submit the current editor contents without review.
 
 ## Bypasses
 
@@ -56,6 +58,12 @@ To skip review once for a normal prompt, prefix it with a backslash:
 
 ```text
 \send this directly without review
+```
+
+To submit the current editor contents immediately without review, press:
+
+```text
+Ctrl+S
 ```
 
 ## Usage

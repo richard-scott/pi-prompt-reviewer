@@ -95,6 +95,7 @@ const TARGET_LANGUAGE_MATCH_INPUT_ALIASES = new Set(["match input", "match-input
 const REVIEW_STATE_ENTRY = "prompt-review:state";
 const REVIEW_WIDGET_KEY = "prompt-review";
 const REVERT_SHORTCUT_LABEL = "Ctrl+Alt+R";
+const SUBMIT_WITHOUT_REVIEW_SHORTCUT_LABEL = "Ctrl+S";
 const REVIEW_CONFIG_TEST_PROMPT = "Reply with exactly OK and nothing else.";
 const MAX_CONTEXT_CHARS = 4_000;
 const AUTO_REVIEWER_MODEL_CANDIDATES = [
@@ -242,6 +243,7 @@ function buildHelpText(
     "- the reviewed prompt is loaded back into the editor",
     "- review details are shown above the editor",
     `- press Enter to send the reviewed prompt, or use /prompt-review revert or ${REVERT_SHORTCUT_LABEL} to restore the original`,
+    `- press ${SUBMIT_WITHOUT_REVIEW_SHORTCUT_LABEL} to submit the current editor contents without review`,
     "",
     "Context modes:",
     "- off: do not send recent conversation context",
@@ -266,6 +268,7 @@ function buildHelpText(
     "- slash commands and !bash shortcuts are not reviewed",
     "- prompts with image attachments are sent directly",
     "- prefix a prompt with \\ to skip review once",
+    `- press ${SUBMIT_WITHOUT_REVIEW_SHORTCUT_LABEL} to submit the current editor contents without review`,
     "",
     "Tip:",
     "- edit .pi/extensions/prompt-review.ts to change the reviewer behavior",
@@ -459,7 +462,9 @@ function formatReviewWidgetLines(
     lines.push("The reviewer kept your prompt essentially unchanged.");
   }
 
-  lines.push(`Press Enter to send it, or use /prompt-review revert or ${REVERT_SHORTCUT_LABEL} to restore the original prompt.`);
+  lines.push(
+    `Press Enter to send it, use /prompt-review revert or ${REVERT_SHORTCUT_LABEL} to restore the original prompt, or press ${SUBMIT_WITHOUT_REVIEW_SHORTCUT_LABEL} to submit the current editor contents without review.`,
+  );
 
   return lines;
 }
@@ -945,6 +950,46 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
     return true;
   };
 
+  const submitEditorWithoutReview = (ctx: ExtensionContext) => {
+    currentCtx = ctx;
+    completionCtx = ctx;
+
+    if (!ctx.hasUI) return;
+
+    const prompt = ctx.ui.getEditorText();
+    if (!prompt.trim()) {
+      ctx.ui.notify("No prompt to submit.", "info");
+      return;
+    }
+
+    if (reviewInFlight) {
+      ctx.ui.notify(
+        "A prompt review is already running. Wait for it to finish before submitting.",
+        "warning",
+      );
+      return;
+    }
+
+    const sendImmediately = ctx.isIdle();
+
+    try {
+      pi.sendUserMessage(prompt, sendImmediately ? undefined : { deliverAs: "followUp" });
+    } catch (error) {
+      ctx.ui.notify(
+        `Failed to submit without review: ${error instanceof Error ? error.message : String(error)}`,
+        "error",
+      );
+      return;
+    }
+
+    approvedPrompt = undefined;
+    activeReview = undefined;
+    clearReviewWidget(ctx);
+    ctx.ui.setEditorText("");
+    updateStatus(ctx, enabled, contextMode, targetLanguage, reviewInFlight);
+    ctx.ui.notify(sendImmediately ? "Submitted without prompt review." : "Queued without prompt review.", "info");
+  };
+
   const showReviewWidget = (
     ctx: ExtensionContext,
     review: ParsedReview,
@@ -1322,6 +1367,13 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
     },
   });
 
+  pi.registerShortcut(Key.ctrl("s"), {
+    description: "Submit the current prompt without prompt review",
+    handler: async (ctx) => {
+      submitEditorWithoutReview(ctx);
+    },
+  });
+
   pi.on("input", async (event, ctx) => {
     currentCtx = ctx;
     completionCtx = ctx;
@@ -1474,7 +1526,7 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
       reviewRun.cost,
     );
     ctx.ui.notify(
-      `Reviewed prompt loaded. Press Enter to send it, or use /prompt-review revert or ${REVERT_SHORTCUT_LABEL} to restore the original.`,
+      `Reviewed prompt loaded. Press Enter to send it, use /prompt-review revert or ${REVERT_SHORTCUT_LABEL} to restore the original, or press ${SUBMIT_WITHOUT_REVIEW_SHORTCUT_LABEL} to submit without review.`,
       "info",
     );
     updateStatus(ctx, enabled, contextMode, targetLanguage, false);
