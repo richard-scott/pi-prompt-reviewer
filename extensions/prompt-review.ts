@@ -25,8 +25,20 @@ type ReviewState = {
 
 type ReviewPreferences = Pick<ReviewState, "targetLanguage" | "reviewerModel" | "reviewerThinking">;
 
+type ReviewShortcutValue = string | false;
+
+type ReviewShortcuts = {
+  submitWithoutReview: ReviewShortcutValue;
+  revert: ReviewShortcutValue;
+};
+
+type ReviewConfig = Partial<ReviewPreferences> & {
+  shortcuts?: Partial<Record<keyof ReviewShortcuts, unknown>>;
+};
+
 type LoadedReviewPreferences = {
   preferences: ReviewPreferences;
+  shortcuts: ReviewShortcuts;
   source: "file" | "missing" | "invalid";
 };
 
@@ -104,8 +116,8 @@ const TARGET_LANGUAGE_MATCH_INPUT_ALIASES = new Set(["match input", "match-input
 const REVIEW_STATE_ENTRY = "prompt-review:state";
 const REVIEW_PREFERENCES_FILE = "prompt-reviewer.json";
 const REVIEW_WIDGET_KEY = "prompt-review";
-const REVERT_SHORTCUT_LABEL = "Ctrl+Alt+R";
-const SUBMIT_WITHOUT_REVIEW_SHORTCUT_LABEL = "Ctrl+Shift+S";
+const DEFAULT_REVERT_SHORTCUT = Key.ctrlAlt("r");
+const DEFAULT_SUBMIT_WITHOUT_REVIEW_SHORTCUT = Key.ctrlShift("s");
 const REVIEW_CONFIG_TEST_PROMPT = "Reply with exactly OK and nothing else.";
 const MAX_CONTEXT_CHARS = 4_000;
 const AUTO_REVIEWER_MODEL_CANDIDATES = [
@@ -217,13 +229,41 @@ async function getCommandCompletions(prefix: string): Promise<AutocompleteItem[]
   return null;
 }
 
+function formatShortcutLabel(shortcut: ReviewShortcutValue): string | undefined {
+  if (!shortcut) return undefined;
+  return shortcut
+    .split("+")
+    .map((part) => {
+      if (part === "ctrl") return "Ctrl";
+      if (part === "alt") return "Alt";
+      if (part === "shift") return "Shift";
+      return part.length === 1 ? part.toUpperCase() : part;
+    })
+    .join("+");
+}
+
+function formatRevertInstruction(revertShortcutLabel: string | undefined): string {
+  return revertShortcutLabel
+    ? `/prompt-review revert or ${revertShortcutLabel}`
+    : "/prompt-review revert";
+}
+
+function formatSubmitWithoutReviewInstruction(submitWithoutReviewShortcutLabel: string | undefined): string | undefined {
+  if (!submitWithoutReviewShortcutLabel) return undefined;
+  return `press ${submitWithoutReviewShortcutLabel} to submit the current editor contents without review`;
+}
+
 function buildHelpText(
   enabled: boolean,
   contextMode: ReviewContextMode,
   targetLanguage: string,
   reviewerModel: string | undefined,
   reviewerThinking: ReviewerThinkingLevel,
+  revertShortcutLabel: string | undefined,
+  submitWithoutReviewShortcutLabel: string | undefined,
 ): string {
+  const submitWithoutReviewInstruction = formatSubmitWithoutReviewInstruction(submitWithoutReviewShortcutLabel);
+
   return [
     "Usage:",
     "  /prompt-review on",
@@ -252,8 +292,8 @@ function buildHelpText(
     "- a lightweight review session reviews and rewrites the prompt",
     "- the reviewed prompt is loaded back into the editor",
     "- review details are shown above the editor",
-    `- press Enter to send the reviewed prompt, or use /prompt-review revert or ${REVERT_SHORTCUT_LABEL} to restore the original`,
-    `- press ${SUBMIT_WITHOUT_REVIEW_SHORTCUT_LABEL} to submit the current editor contents without review`,
+    `- press Enter to send the reviewed prompt, or use ${formatRevertInstruction(revertShortcutLabel)} to restore the original`,
+    submitWithoutReviewInstruction ? `- ${submitWithoutReviewInstruction}` : null,
     "",
     "Context modes:",
     "- off: do not send recent conversation context",
@@ -275,18 +315,20 @@ function buildHelpText(
     "- thinking changes are tested before they are saved",
     "",
     "Persistent preferences:",
-    "- target language, reviewer model, and reviewer thinking are saved across sessions",
+    "- target language, reviewer model, reviewer thinking, and shortcuts are saved across sessions",
     "- enabled/disabled and context mode remain session-specific settings",
     "",
     "Bypasses:",
     "- slash commands and !bash shortcuts are not reviewed",
     "- prompts with image attachments are sent directly",
     "- prefix a prompt with \\ to skip review once",
-    `- press ${SUBMIT_WITHOUT_REVIEW_SHORTCUT_LABEL} to submit the current editor contents without review`,
+    submitWithoutReviewInstruction ? `- ${submitWithoutReviewInstruction}` : null,
     "",
-    "Tip:",
-    "- edit .pi/extensions/prompt-review.ts to change the reviewer behavior",
-  ].join("\n");
+    "Shortcuts:",
+    `- revert reviewed prompt: ${revertShortcutLabel ?? "disabled"}`,
+    `- submit without review: ${submitWithoutReviewShortcutLabel ?? "disabled"}`,
+    `- configure shortcuts in ${getReviewPreferencesPath()} (set a shortcut to false to disable it, then reload pi)`,
+  ].filter((line): line is string => line != null).join("\n");
 }
 
 function buildStatusText(
@@ -443,6 +485,8 @@ function formatReviewWidgetLines(
   reviewerThinking: ReviewerThinkingLevel,
   tokens: TokenUsage | undefined,
   cost: number | undefined,
+  revertShortcutLabel: string | undefined,
+  submitWithoutReviewShortcutLabel: string | undefined,
 ): string[] {
   const metadataParts = [
     `context: ${contextLabel}`,
@@ -476,8 +520,12 @@ function formatReviewWidgetLines(
     lines.push("The reviewer kept your prompt essentially unchanged.");
   }
 
+  const submitWithoutReviewInstruction = formatSubmitWithoutReviewInstruction(submitWithoutReviewShortcutLabel);
+  const finalInstruction = `Press Enter to send it, use ${formatRevertInstruction(revertShortcutLabel)} to restore the original prompt`;
   lines.push(
-    `Press Enter to send it, use /prompt-review revert or ${REVERT_SHORTCUT_LABEL} to restore the original prompt, or press ${SUBMIT_WITHOUT_REVIEW_SHORTCUT_LABEL} to submit the current editor contents without review.`,
+    submitWithoutReviewInstruction
+      ? `${finalInstruction}, or ${submitWithoutReviewInstruction}.`
+      : `${finalInstruction}.`,
   );
 
   return lines;
@@ -784,6 +832,13 @@ function getDefaultReviewPreferences(): ReviewPreferences {
   };
 }
 
+function getDefaultReviewShortcuts(): ReviewShortcuts {
+  return {
+    submitWithoutReview: DEFAULT_SUBMIT_WITHOUT_REVIEW_SHORTCUT,
+    revert: DEFAULT_REVERT_SHORTCUT,
+  };
+}
+
 function getReviewPreferencesPath(): string {
   return join(getAgentDir(), "extensions", REVIEW_PREFERENCES_FILE);
 }
@@ -810,19 +865,59 @@ function normalizeReviewPreferences(
   return normalized;
 }
 
+function normalizeShortcutValue(value: unknown, fallback: ReviewShortcutValue): ReviewShortcutValue {
+  if (value === undefined) return fallback;
+  if (value === false || value === null) return false;
+  if (typeof value !== "string") return fallback;
+
+  const normalized = value.trim().toLowerCase();
+  if (!normalized || normalized === "off" || normalized === "none" || normalized === "disabled") return false;
+  return normalized;
+}
+
+function normalizeReviewShortcuts(
+  shortcuts: Partial<Record<keyof ReviewShortcuts, unknown>> | undefined,
+  fallback: ReviewShortcuts = getDefaultReviewShortcuts(),
+): ReviewShortcuts {
+  return {
+    submitWithoutReview: normalizeShortcutValue(shortcuts?.submitWithoutReview, fallback.submitWithoutReview),
+    revert: normalizeShortcutValue(shortcuts?.revert, fallback.revert),
+  };
+}
+
+function readRawReviewConfig(): Record<string, unknown> | undefined {
+  const preferencesPath = getReviewPreferencesPath();
+  if (!existsSync(preferencesPath)) return undefined;
+
+  const data = JSON.parse(readFileSync(preferencesPath, "utf8")) as unknown;
+  return data && typeof data === "object" && !Array.isArray(data) ? data as Record<string, unknown> : {};
+}
+
 function readReviewPreferences(fallback: ReviewPreferences): LoadedReviewPreferences {
   const preferencesPath = getReviewPreferencesPath();
   if (!existsSync(preferencesPath)) {
-    return { preferences: normalizeReviewPreferences(undefined, fallback), source: "missing" };
+    return {
+      preferences: normalizeReviewPreferences(undefined, fallback),
+      shortcuts: getDefaultReviewShortcuts(),
+      source: "missing",
+    };
   }
 
   try {
-    const data = JSON.parse(readFileSync(preferencesPath, "utf8")) as Partial<ReviewPreferences>;
-    return { preferences: normalizeReviewPreferences(data), source: "file" };
+    const data = readRawReviewConfig() as ReviewConfig | undefined;
+    return {
+      preferences: normalizeReviewPreferences(data, fallback),
+      shortcuts: normalizeReviewShortcuts(data?.shortcuts),
+      source: "file",
+    };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     process.stderr.write(`Warning: failed to load prompt review preferences from ${preferencesPath}: ${message}\n`);
-    return { preferences: normalizeReviewPreferences(undefined, fallback), source: "invalid" };
+    return {
+      preferences: normalizeReviewPreferences(undefined, fallback),
+      shortcuts: getDefaultReviewShortcuts(),
+      source: "invalid",
+    };
   }
 }
 
@@ -837,12 +932,15 @@ function hasCustomReviewPreferences(preferences: ReviewPreferences): boolean {
 function persistReviewPreferences(preferences: ReviewPreferences): void {
   const preferencesPath = getReviewPreferencesPath();
   const normalized = normalizeReviewPreferences(preferences);
-  const serialized = {
-    ...normalized,
-    reviewerModel: normalized.reviewerModel ?? "auto",
-  };
 
   try {
+    const existing = readRawReviewConfig() ?? {};
+    const serialized = {
+      ...existing,
+      ...normalized,
+      reviewerModel: normalized.reviewerModel ?? "auto",
+    };
+
     mkdirSync(dirname(preferencesPath), { recursive: true });
     writeFileSync(preferencesPath, `${JSON.stringify(serialized, null, 2)}\n`, "utf8");
   } catch (error) {
@@ -1019,6 +1117,12 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
   let currentCtx: ExtensionContext | undefined;
   let reviewInFlight = false;
 
+  const configuredShortcuts = readReviewPreferences(getDefaultReviewPreferences()).shortcuts;
+  const revertShortcut = configuredShortcuts.revert;
+  const submitWithoutReviewShortcut = configuredShortcuts.submitWithoutReview;
+  const revertShortcutLabel = formatShortcutLabel(revertShortcut);
+  const submitWithoutReviewShortcutLabel = formatShortcutLabel(submitWithoutReviewShortcut);
+
   const clearReviewWidget = (ctx: ExtensionContext | undefined = currentCtx) => {
     if (!ctx?.hasUI) return;
     ctx.ui.setWidget(REVIEW_WIDGET_KEY, undefined);
@@ -1098,6 +1202,8 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
     reviewerThinking: ReviewerThinkingLevel,
     tokens: TokenUsage | undefined,
     cost: number | undefined,
+    revertShortcutLabel: string | undefined,
+    submitWithoutReviewShortcutLabel: string | undefined,
   ) => {
     if (!ctx.hasUI) return;
 
@@ -1110,6 +1216,8 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
       reviewerThinking,
       tokens,
       cost,
+      revertShortcutLabel,
+      submitWithoutReviewShortcutLabel,
     );
     const themeColor = review.decision === "needs_clarification" ? "warning" : "accent";
 
@@ -1194,7 +1302,15 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
       }
 
       if (action === "help") {
-        const helpText = buildHelpText(enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking);
+        const helpText = buildHelpText(
+          enabled,
+          contextMode,
+          targetLanguage,
+          reviewerModel,
+          reviewerThinking,
+          revertShortcutLabel,
+          submitWithoutReviewShortcutLabel,
+        );
         if (ctx.hasUI) {
           await ctx.ui.confirm("Prompt review help", helpText);
         } else {
@@ -1476,19 +1592,23 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
     },
   });
 
-  pi.registerShortcut(Key.ctrlAlt("r"), {
-    description: "Restore the original prompt after prompt review",
-    handler: async (ctx) => {
-      revertActiveReview(ctx);
-    },
-  });
+  if (revertShortcut) {
+    pi.registerShortcut(revertShortcut, {
+      description: "Restore the original prompt after prompt review",
+      handler: async (ctx) => {
+        revertActiveReview(ctx);
+      },
+    });
+  }
 
-  pi.registerShortcut(Key.ctrlShift("s"), {
-    description: "Submit the current prompt without prompt review",
-    handler: async (ctx) => {
-      submitEditorWithoutReview(ctx);
-    },
-  });
+  if (submitWithoutReviewShortcut) {
+    pi.registerShortcut(submitWithoutReviewShortcut, {
+      description: "Submit the current prompt without prompt review",
+      handler: async (ctx) => {
+        submitEditorWithoutReview(ctx);
+      },
+    });
+  }
 
   pi.on("input", async (event, ctx) => {
     currentCtx = ctx;
@@ -1640,9 +1760,14 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
       pending.reviewerThinking,
       reviewRun.tokens,
       reviewRun.cost,
+      revertShortcutLabel,
+      submitWithoutReviewShortcutLabel,
     );
+    const submitWithoutReviewInstruction = formatSubmitWithoutReviewInstruction(submitWithoutReviewShortcutLabel);
     ctx.ui.notify(
-      `Reviewed prompt loaded. Press Enter to send it, use /prompt-review revert or ${REVERT_SHORTCUT_LABEL} to restore the original, or press ${SUBMIT_WITHOUT_REVIEW_SHORTCUT_LABEL} to submit without review.`,
+      submitWithoutReviewInstruction
+        ? `Reviewed prompt loaded. Press Enter to send it, use ${formatRevertInstruction(revertShortcutLabel)} to restore the original, or ${submitWithoutReviewInstruction}.`
+        : `Reviewed prompt loaded. Press Enter to send it, or use ${formatRevertInstruction(revertShortcutLabel)} to restore the original.`,
       "info",
     );
     updateStatus(ctx, enabled, contextMode, targetLanguage, false);

@@ -21,8 +21,9 @@ prompt before it is sent to the main session.
 - lets you choose the target language, reviewer model, and thinking level
 - remembers the target language, reviewer model, and thinking level across sessions
 - loads the reviewed prompt back into the editor automatically
-- lets you submit immediately without review via `Ctrl+Shift+S`
+- lets you submit immediately without review via `Ctrl+Shift+S` by default
 - lets you restore the original prompt with a command or shortcut
+- lets you remap or disable its shortcuts
 - displays token usage and cost for the review step
 
 ## Install
@@ -61,7 +62,8 @@ To skip review once for a normal prompt, prefix it with a backslash:
 \send this directly without review
 ```
 
-To submit the current editor contents immediately without review, press:
+To submit the current editor contents immediately without review, press the
+configured shortcut. The default is:
 
 ```text
 Ctrl+Shift+S
@@ -94,6 +96,43 @@ Default shortcut:
 
 ```text
 Ctrl+Alt+R
+```
+
+### Configure shortcuts
+
+Shortcuts are read from the same persistent preferences file used for reviewer
+settings:
+
+```text
+~/.pi/agent/extensions/prompt-reviewer.json
+```
+
+Example:
+
+```json
+{
+  "shortcuts": {
+    "submitWithoutReview": "ctrl+shift+f",
+    "revert": "ctrl+alt+r"
+  }
+}
+```
+
+Set either shortcut to `false` to disable it:
+
+```json
+{
+  "shortcuts": {
+    "submitWithoutReview": false,
+    "revert": false
+  }
+}
+```
+
+After editing the file, reload pi:
+
+```text
+/reload
 ```
 
 ### Configure context mode
@@ -167,8 +206,9 @@ This is usually the best balance of speed, cost, and review quality.
 Thinking changes are also tested before they are saved. If the test fails, the
 extension warns you and keeps the previous reviewer thinking level.
 
-Target language, reviewer model, and reviewer thinking choices are saved across
-sessions. The enabled/disabled state and context mode remain session-specific.
+Target language, reviewer model, reviewer thinking, and shortcut choices are
+saved across sessions. The enabled/disabled state and context mode remain
+session-specific.
 
 ## Retry behavior
 
