@@ -14,6 +14,7 @@ import { fuzzyFilter, Key, wrapTextWithAnsi, type AutocompleteItem } from "@mari
 
 type ReviewContextMode = "off" | "always";
 type ReviewerThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+type EnglishDialectMode = "auto" | "british" | "us" | "preserve";
 
 type ReviewState = {
   enabled: boolean;
@@ -21,9 +22,13 @@ type ReviewState = {
   targetLanguage: string;
   reviewerModel?: string;
   reviewerThinking: ReviewerThinkingLevel;
+  autoSubmit: boolean;
+  englishDialect: EnglishDialectMode;
+  processingText: string;
+  showProcessingStatus: boolean;
 };
 
-type ReviewPreferences = Pick<ReviewState, "targetLanguage" | "reviewerModel" | "reviewerThinking">;
+type ReviewPreferences = Pick<ReviewState, "targetLanguage" | "reviewerModel" | "reviewerThinking" | "autoSubmit" | "englishDialect" | "processingText" | "showProcessingStatus">;
 
 type LoadedReviewPreferences = {
   preferences: ReviewPreferences;
@@ -36,6 +41,7 @@ type PendingReview = {
   targetLanguage: string;
   reviewerModelLabel: string;
   reviewerThinking: ReviewerThinkingLevel;
+  englishDialect: EnglishDialectMode;
   reviewContext?: ReviewContext;
   retryCount: number;
 };
@@ -75,15 +81,24 @@ type ActiveReview = {
   reviewedText: string;
 };
 
-const ROOT_COMMAND_OPTIONS = ["on", "off", "toggle", "status", "help", "context", "language", "model", "thinking", "revert"] as const;
+const ROOT_COMMAND_OPTIONS = ["on", "off", "toggle", "status", "help", "context", "autosubmit", "dialect", "processing", "processing-status", "language", "model", "thinking", "revert"] as const;
 const CONTEXT_MODE_OPTIONS = ["off", "always"] as const;
+const AUTOSUBMIT_OPTIONS = ["on", "off"] as const;
+const PROCESSING_STATUS_OPTIONS = ["on", "off"] as const;
+const ENGLISH_DIALECT_OPTIONS = ["auto", "british", "us", "preserve"] as const;
 const THINKING_LEVEL_OPTIONS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 const DEFAULT_CONTEXT_MODE: ReviewContextMode = "always";
 const DEFAULT_TARGET_LANGUAGE = "match input";
 const DEFAULT_REVIEWER_THINKING: ReviewerThinkingLevel = "off";
+const DEFAULT_ENGLISH_DIALECT: EnglishDialectMode = "auto";
+const DEFAULT_PROCESSING_TEXT = "Processing";
 const TARGET_LANGUAGE_OPTIONS = [
   DEFAULT_TARGET_LANGUAGE,
   "English",
+  "UK English",
+  "British English",
+  "US English",
+  "American English",
   "Spanish",
   "French",
   "German",
@@ -107,6 +122,7 @@ const REVIEW_WIDGET_KEY = "prompt-review";
 const REVERT_SHORTCUT_LABEL = "Ctrl+Alt+R";
 const SUBMIT_WITHOUT_REVIEW_SHORTCUT_LABEL = "Ctrl+Shift+S";
 const REVIEW_CONFIG_TEST_PROMPT = "Reply with exactly OK and nothing else.";
+const REVIEW_INDICATOR_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
 const MAX_CONTEXT_CHARS = 4_000;
 const AUTO_REVIEWER_MODEL_CANDIDATES = [
   "haiku",
@@ -136,12 +152,25 @@ function normalizeCommand(value: string): string {
   return value.trim().toLowerCase();
 }
 
+function normalizeProcessingText(value: string | undefined): string {
+  const normalized = (value ?? "").trim().replace(/\s+/g, " ");
+  return normalized || DEFAULT_PROCESSING_TEXT;
+}
+
+function formatProcessingText(value: string): string {
+  return `${normalizeProcessingText(value).replace(/[.。…]+$/g, "")}...`;
+}
+
 function isContextMode(value: string): value is ReviewContextMode {
   return CONTEXT_MODE_OPTIONS.includes(value as ReviewContextMode);
 }
 
 function isThinkingLevel(value: string): value is ReviewerThinkingLevel {
   return THINKING_LEVEL_OPTIONS.includes(value as ReviewerThinkingLevel);
+}
+
+function isEnglishDialectMode(value: string): value is EnglishDialectMode {
+  return ENGLISH_DIALECT_OPTIONS.includes(value as EnglishDialectMode);
 }
 
 function normalizeTargetLanguage(value: string): string {
@@ -157,6 +186,155 @@ function normalizeTargetLanguage(value: string): string {
 
 function isMatchInputTargetLanguage(targetLanguage: string): boolean {
   return normalizeTargetLanguage(targetLanguage) === DEFAULT_TARGET_LANGUAGE;
+}
+
+function detectLocalEnglishDialect(): string {
+  const explicitLocaleCandidates = [
+    process.env.LC_ALL,
+    process.env.LC_MESSAGES,
+    process.env.LANG,
+  ]
+    .filter((value): value is string => Boolean(value))
+    .map((value) => value.replace(/\.UTF-?8$/i, "").replace(/_/g, "-"))
+    .filter((value) => !/^(C|POSIX)$/i.test(value));
+
+  const britishEnglishRegions = new Set(["GB", "IE", "AU", "NZ", "ZA"]);
+  const americanEnglishRegions = new Set(["US", "PH"]);
+
+  const classifyLocale = (locale: string): string | undefined => {
+    const match = locale.match(/^en-([A-Za-z]{2})\b/i);
+    const region = match?.[1]?.toUpperCase();
+    if (!region) return undefined;
+    if (britishEnglishRegions.has(region)) return "British English";
+    if (americanEnglishRegions.has(region)) return "US English";
+    return undefined;
+  };
+
+  for (const locale of explicitLocaleCandidates) {
+    const dialect = classifyLocale(locale);
+    if (dialect) return dialect;
+  }
+
+  const timeZoneCandidates = [
+    process.env.TZ,
+    Intl.DateTimeFormat().resolvedOptions().timeZone,
+  ].filter((value): value is string => Boolean(value));
+
+  if (timeZoneCandidates.some((timeZone) => /^(Europe\/London|Europe\/Dublin)$/i.test(timeZone))) {
+    return "British English";
+  }
+  if (timeZoneCandidates.some((timeZone) => /^(Australia\/|Pacific\/Auckland|Pacific\/Chatham|Africa\/Johannesburg)/i.test(timeZone))) {
+    return "British English";
+  }
+
+  const runtimeLocale = Intl.DateTimeFormat().resolvedOptions().locale;
+  const runtimeDialect = runtimeLocale ? classifyLocale(runtimeLocale.replace(/_/g, "-")) : undefined;
+  if (runtimeDialect) return runtimeDialect;
+
+  return "unknown; infer from the input prompt and reference context";
+}
+
+function shouldUseBritishEnglish(targetLanguage: string, englishDialect: EnglishDialectMode): boolean {
+  if (englishDialect === "british") return true;
+  if (englishDialect === "us" || englishDialect === "preserve") return false;
+
+  const normalizedTarget = normalizeTargetLanguage(targetLanguage).toLowerCase();
+  if (/(^|\b)(uk|british|commonwealth)(\b|$)/i.test(normalizedTarget)) return true;
+  if (normalizedTarget === DEFAULT_TARGET_LANGUAGE.toLowerCase()) {
+    return detectLocalEnglishDialect() === "British English";
+  }
+  return false;
+}
+
+
+const BRITISH_TO_US_REPLACEMENTS = new Map<string, string>([
+  ["finaize", "finalize"],
+  ["finaized", "finalized"],
+  ["finaizing", "finalizing"],
+  ["finalise", "finalize"],
+  ["finalised", "finalized"],
+  ["finalising", "finalizing"],
+  ["finalisation", "finalization"],
+  ["organise", "organize"],
+  ["organised", "organized"],
+  ["organising", "organizing"],
+  ["organisation", "organization"],
+  ["organisations", "organizations"],
+  ["recognise", "recognize"],
+  ["recognised", "recognized"],
+  ["recognising", "recognizing"],
+  ["recognition", "recognition"],
+  ["realise", "realize"],
+  ["realised", "realized"],
+  ["realising", "realizing"],
+  ["authorise", "authorize"],
+  ["authorised", "authorized"],
+  ["authorising", "authorizing"],
+  ["customise", "customize"],
+  ["customised", "customized"],
+  ["customising", "customizing"],
+  ["optimise", "optimize"],
+  ["optimised", "optimized"],
+  ["optimising", "optimizing"],
+  ["prioritise", "prioritize"],
+  ["prioritised", "prioritized"],
+  ["prioritising", "prioritizing"],
+  ["initialise", "initialize"],
+  ["initialised", "initialized"],
+  ["initialising", "initializing"],
+  ["normalise", "normalize"],
+  ["normalised", "normalized"],
+  ["normalising", "normalizing"],
+  ["serialise", "serialize"],
+  ["serialised", "serialized"],
+  ["serialising", "serializing"],
+  ["specialise", "specialize"],
+  ["specialised", "specialized"],
+  ["specialising", "specializing"],
+  ["summarise", "summarize"],
+  ["summarised", "summarized"],
+  ["summarising", "summarizing"],
+  ["categorise", "categorize"],
+  ["categorised", "categorized"],
+  ["categorising", "categorizing"],
+  ["visualise", "visualize"],
+  ["visualised", "visualized"],
+  ["visualising", "visualizing"],
+  ["utilise", "utilize"],
+  ["utilised", "utilized"],
+  ["utilising", "utilizing"],
+  ["standardise", "standardize"],
+  ["standardised", "standardized"],
+  ["standardising", "standardizing"],
+  ["modernise", "modernize"],
+  ["modernised", "modernized"],
+  ["modernising", "modernizing"],
+]);
+
+function matchCase(source: string, replacement: string): string {
+  if (source.toUpperCase() === source) return replacement.toUpperCase();
+  if (source[0]?.toUpperCase() === source[0]) {
+    return replacement[0]!.toUpperCase() + replacement.slice(1);
+  }
+  return replacement;
+}
+
+const BRITISH_REPLACEMENTS = new Map<string, string>([
+  ["finaize", "finalise"],
+  ...[...BRITISH_TO_US_REPLACEMENTS]
+    .filter(([source, replacement]) => source !== replacement && !source.startsWith("finaiz"))
+    .map(([source, replacement]) => [replacement, source] as [string, string]),
+]);
+
+function applyWordReplacements(text: string, replacements: Map<string, string>): string {
+  return text.replace(/\b[A-Za-z]+\b/g, (word) => {
+    const replacement = replacements.get(word.toLowerCase());
+    return replacement ? matchCase(word, replacement) : word;
+  });
+}
+
+function applyBritishEnglish(text: string): string {
+  return applyWordReplacements(text, BRITISH_REPLACEMENTS);
 }
 
 function getTargetLanguageCompletions(languagePrefix: string): AutocompleteItem[] | null {
@@ -202,6 +380,30 @@ async function getCommandCompletions(prefix: string): Promise<AutocompleteItem[]
     return values.length > 0 ? values : null;
   }
 
+  if (tokens[0] === "dialect") {
+    const dialectPrefix = hasTrailingSpace ? "" : (tokens[1] ?? "");
+    const values = ENGLISH_DIALECT_OPTIONS
+      .filter((value) => value.startsWith(dialectPrefix))
+      .map((value) => ({ value: `dialect ${value}`, label: `dialect ${value}` }));
+    return values.length > 0 ? values : null;
+  }
+
+  if (tokens[0] === "autosubmit") {
+    const autoSubmitPrefix = hasTrailingSpace ? "" : (tokens[1] ?? "");
+    const values = AUTOSUBMIT_OPTIONS
+      .filter((value) => value.startsWith(autoSubmitPrefix))
+      .map((value) => ({ value: `autosubmit ${value}`, label: `autosubmit ${value}` }));
+    return values.length > 0 ? values : null;
+  }
+
+  if (tokens[0] === "processing-status") {
+    const statusPrefix = hasTrailingSpace ? "" : (tokens[1] ?? "");
+    const values = PROCESSING_STATUS_OPTIONS
+      .filter((value) => value.startsWith(statusPrefix))
+      .map((value) => ({ value: `processing-status ${value}`, label: `processing-status ${value}` }));
+    return values.length > 0 ? values : null;
+  }
+
   if (tokens[0] === "thinking") {
     const levelPrefix = hasTrailingSpace ? "" : (tokens[1] ?? "");
     const values = THINKING_LEVEL_OPTIONS
@@ -223,6 +425,10 @@ function buildHelpText(
   targetLanguage: string,
   reviewerModel: string | undefined,
   reviewerThinking: ReviewerThinkingLevel,
+  autoSubmit: boolean,
+  englishDialect: EnglishDialectMode,
+  processingText: string,
+  showProcessingStatus: boolean,
 ): string {
   return [
     "Usage:",
@@ -232,6 +438,13 @@ function buildHelpText(
     "  /prompt-review status",
     "  /prompt-review context",
     "  /prompt-review context off|always",
+    "  /prompt-review autosubmit",
+    "  /prompt-review autosubmit on|off",
+    "  /prompt-review dialect",
+    "  /prompt-review dialect auto|british|us|preserve",
+    "  /prompt-review processing",
+    "  /prompt-review processing <text>",
+    "  /prompt-review processing-status on|off",
     "  /prompt-review language",
     "  /prompt-review language match input|<language>",
     "  /prompt-review model",
@@ -246,18 +459,40 @@ function buildHelpText(
     `Current target language: ${targetLanguage}`,
     `Current reviewer model: ${reviewerModel ?? "auto"}`,
     `Current reviewer thinking: ${reviewerThinking}`,
+    `Current auto-submit: ${autoSubmit ? "on" : "off"}`,
+    `Current English dialect: ${englishDialect}`,
+    `Current processing text: ${normalizeProcessingText(processingText)}`,
+    `Current processing status: ${showProcessingStatus ? "on" : "off"}`,
     "",
     "When enabled:",
     "- normal prompts are intercepted before they reach the main session",
     "- a lightweight review session reviews and rewrites the prompt",
     "- the reviewed prompt is loaded back into the editor",
-    "- review details are shown above the editor",
+    "- when auto-submit is on, ready/revised reviewed prompts are sent immediately instead",
+    "- review details are shown above the editor when the reviewed prompt is not auto-submitted",
     `- press Enter to send the reviewed prompt, or use /prompt-review revert or ${REVERT_SHORTCUT_LABEL} to restore the original`,
     `- press ${SUBMIT_WITHOUT_REVIEW_SHORTCUT_LABEL} to submit the current editor contents without review`,
     "",
     "Context modes:",
     "- off: do not send recent conversation context",
     "- always: always send the previous user prompt and last assistant reply when they exist",
+    "",
+    "Auto-submit:",
+    "- autosubmit off: load the reviewed prompt back into the editor for approval",
+    "- autosubmit on: automatically send ready/revised reviewed prompts",
+    "- auto-submit is skipped when the reviewer says the prompt needs clarification",
+    "",
+    "English dialect:",
+    "- dialect auto: infer from target language, locale, and time zone",
+    "- dialect british: force British English with -ise spellings and normalise common -ize forms to -ise",
+    "- dialect us: force US English instructions",
+    "- dialect preserve: preserve the prompt's existing dialect",
+    "",
+    "Processing text:",
+    "- processing: show the configured review-in-progress text",
+    "- processing <text>: save the text shown with the loading indicator while review runs",
+    "- processing-status on|off: show or hide the review-in-progress indicator and working message",
+    "- stored in ~/.pi/agent/extensions/prompt-reviewer.json as processingText and showProcessingStatus",
     "",
     "Target language:",
     "- language match input: write the reviewed prompt in the input prompt's language",
@@ -275,7 +510,7 @@ function buildHelpText(
     "- thinking changes are tested before they are saved",
     "",
     "Persistent preferences:",
-    "- target language, reviewer model, and reviewer thinking are saved across sessions",
+    "- target language, English dialect, processing text/status, reviewer model, reviewer thinking, and auto-submit are saved across sessions",
     "- enabled/disabled and context mode remain session-specific settings",
     "",
     "Bypasses:",
@@ -285,7 +520,7 @@ function buildHelpText(
     `- press ${SUBMIT_WITHOUT_REVIEW_SHORTCUT_LABEL} to submit the current editor contents without review`,
     "",
     "Tip:",
-    "- edit .pi/extensions/prompt-review.ts to change the reviewer behavior",
+    "- edit .pi/extensions/prompt-review.ts to change the reviewer behaviour",
   ].join("\n");
 }
 
@@ -295,8 +530,12 @@ function buildStatusText(
   targetLanguage: string,
   reviewerModel: string | undefined,
   reviewerThinking: ReviewerThinkingLevel,
+  autoSubmit: boolean,
+  englishDialect: EnglishDialectMode,
+  processingText: string,
+  showProcessingStatus: boolean,
 ): string {
-  return `prompt review: ${enabled ? "enabled" : "disabled"} (context: ${contextMode}, language: ${targetLanguage}, model: ${reviewerModel ?? "auto"}, thinking: ${reviewerThinking})`;
+  return `prompt review: ${enabled ? "enabled" : "disabled"} (context: ${contextMode}, language: ${targetLanguage}, dialect: ${englishDialect}, processing: ${normalizeProcessingText(processingText)}, processingStatus: ${showProcessingStatus ? "on" : "off"}, model: ${reviewerModel ?? "auto"}, thinking: ${reviewerThinking}, autosubmit: ${autoSubmit ? "on" : "off"})`;
 }
 
 function buildContextModeText(contextMode: ReviewContextMode): string {
@@ -315,9 +554,32 @@ function buildThinkingText(reviewerThinking: ReviewerThinkingLevel): string {
   return `prompt review thinking: ${reviewerThinking}`;
 }
 
-function buildReviewPrompt(prompt: string, targetLanguage: string, context?: ReviewContext): string {
+function buildAutoSubmitText(autoSubmit: boolean): string {
+  return `prompt review autosubmit: ${autoSubmit ? "on" : "off"}`;
+}
+
+function buildDialectText(englishDialect: EnglishDialectMode): string {
+  return `prompt review English dialect: ${englishDialect}`;
+}
+
+function buildProcessingText(processingText: string): string {
+  return `prompt review processing text: ${normalizeProcessingText(processingText)}`;
+}
+
+function buildProcessingStatusText(showProcessingStatus: boolean): string {
+  return `prompt review processing status: ${showProcessingStatus ? "on" : "off"}`;
+}
+
+function buildReviewPrompt(
+  prompt: string,
+  targetLanguage: string,
+  englishDialect: EnglishDialectMode,
+  context?: ReviewContext,
+): string {
   const hasContext = Boolean(context?.previousUserPrompt || context?.assistantReply);
   const isMatchInputLanguage = isMatchInputTargetLanguage(targetLanguage);
+  const localEnglishDialect = detectLocalEnglishDialect();
+  const useBritishEnglish = shouldUseBritishEnglish(targetLanguage, englishDialect);
   const languageRule = isMatchInputLanguage
     ? "- TARGET_LANGUAGE is match input: write FINAL_PROMPT content and any clarification question text in the same language as CURRENT_USER_PROMPT_TO_REVIEW. If the input mixes languages, use the primary input language."
     : `- TARGET_LANGUAGE is ${targetLanguage}: you MUST translate FINAL_PROMPT content and any clarification question text into ${targetLanguage}. Do not leave FINAL_PROMPT in the source language unless the source language is already ${targetLanguage}.`;
@@ -328,6 +590,12 @@ function buildReviewPrompt(prompt: string, targetLanguage: string, context?: Rev
     "",
     "TARGET_LANGUAGE:",
     targetLanguage,
+    "ENGLISH_DIALECT_SETTING:",
+    englishDialect,
+    "DETECTED_LOCAL_ENGLISH_DIALECT:",
+    localEnglishDialect,
+    "BRITISH_ENGLISH_REQUIRED:",
+    useBritishEnglish ? "yes" : "no",
     isMatchInputLanguage
       ? "The final prompt should match the input language."
       : `The final prompt must be written in ${targetLanguage}, translating the user's request as needed while preserving intent.`,
@@ -347,6 +615,13 @@ function buildReviewPrompt(prompt: string, targetLanguage: string, context?: Rev
     "- Always include a complete sendable prompt between FINAL_PROMPT_START and FINAL_PROMPT_END.",
     "- Keep required labels such as DECISION, FINAL_PROMPT_START, FINAL_PROMPT_END, and QUESTIONS in English exactly as specified.",
     languageRule,
+    englishDialect === "us"
+      ? "- ENGLISH_DIALECT_SETTING is us: for English output, use US English spelling and phrasing."
+      : englishDialect === "preserve"
+        ? "- ENGLISH_DIALECT_SETTING is preserve: preserve the user's existing English dialect; do not convert between US and British spellings."
+        : useBritishEnglish
+          ? "- BRITISH_ENGLISH_REQUIRED is yes: for all English output, convert to British English with -ise spellings. Use -ise spellings for all words that have a standard British -ise form, including finalise, analyse, organise, normalise, summarise, recognise, theorise, and tantalise. Convert matching -ize/-ized/-izing/-ization variants to -ise/-ised/-ising/-isation. Keep UK forms such as colour, centre, behaviour, and licence (noun). Do not alter words where -ize is part of the root or there is no standard -ise form, such as size, prize, seize, or capsize."
+          : "- ENGLISH_DIALECT_SETTING is auto and no specific English dialect is required: preserve the user's English dialect unless they explicitly ask for another dialect.",
     "- Use DECISION: needs_clarification only when a missing detail would materially improve the result.",
     "- If there are no useful clarification questions, leave the QUESTIONS section empty. Do not write 'None'.",
     hasContext
@@ -517,6 +792,7 @@ const REVIEWER_SYSTEM_PROMPT = [
   "- If the caller gives a target language instruction, it overrides the source",
   "  language. Translate the final prompt and questions into that target language.",
   "- If the caller asks to match the input language, preserve the input language.",
+  "- When writing English, follow the caller's dialect setting. If British English is required, use UK phrasing with -ise spellings for all words that have a standard British -ise form, such as finalise/analyse/organise/normalise/theorise/tantalise; do not convert words like size, prize, seize, or capsize where -ize is not a convertible suffix. Use US English only when requested.",
   "- Do not answer the task itself.",
   "- Do not add extra goals the user did not ask for.",
   "- Improve clarity, sequencing, constraints, expected output, and missing",
@@ -781,6 +1057,10 @@ function getDefaultReviewPreferences(): ReviewPreferences {
     targetLanguage: DEFAULT_TARGET_LANGUAGE,
     reviewerModel: undefined,
     reviewerThinking: DEFAULT_REVIEWER_THINKING,
+    autoSubmit: false,
+    englishDialect: DEFAULT_ENGLISH_DIALECT,
+    processingText: DEFAULT_PROCESSING_TEXT,
+    showProcessingStatus: true,
   };
 }
 
@@ -807,6 +1087,22 @@ function normalizeReviewPreferences(
     normalized.reviewerThinking = preferences.reviewerThinking;
   }
 
+  if (typeof preferences?.autoSubmit === "boolean") {
+    normalized.autoSubmit = preferences.autoSubmit;
+  }
+
+  if (typeof preferences?.englishDialect === "string" && isEnglishDialectMode(preferences.englishDialect)) {
+    normalized.englishDialect = preferences.englishDialect;
+  }
+
+  if (typeof preferences?.processingText === "string") {
+    normalized.processingText = normalizeProcessingText(preferences.processingText);
+  }
+
+  if (typeof preferences?.showProcessingStatus === "boolean") {
+    normalized.showProcessingStatus = preferences.showProcessingStatus;
+  }
+
   return normalized;
 }
 
@@ -831,6 +1127,10 @@ function hasCustomReviewPreferences(preferences: ReviewPreferences): boolean {
     normalizeTargetLanguage(preferences.targetLanguage) !== DEFAULT_TARGET_LANGUAGE
     || Boolean(preferences.reviewerModel)
     || preferences.reviewerThinking !== DEFAULT_REVIEWER_THINKING
+    || preferences.autoSubmit
+    || preferences.englishDialect !== DEFAULT_ENGLISH_DIALECT
+    || normalizeProcessingText(preferences.processingText) !== DEFAULT_PROCESSING_TEXT
+    || !preferences.showProcessingStatus
   );
 }
 
@@ -858,6 +1158,10 @@ function readState(ctx: ExtensionContext): ReviewState {
     targetLanguage: DEFAULT_TARGET_LANGUAGE,
     reviewerModel: undefined,
     reviewerThinking: DEFAULT_REVIEWER_THINKING,
+    autoSubmit: false,
+    englishDialect: DEFAULT_ENGLISH_DIALECT,
+    processingText: DEFAULT_PROCESSING_TEXT,
+    showProcessingStatus: true,
   };
 
   const branch = ctx.sessionManager.getBranch() as Array<{
@@ -887,6 +1191,18 @@ function readState(ctx: ExtensionContext): ReviewState {
     if (typeof data?.reviewerThinking === "string" && isThinkingLevel(data.reviewerThinking)) {
       state = { ...state, reviewerThinking: data.reviewerThinking };
     }
+    if (typeof data?.autoSubmit === "boolean") {
+      state = { ...state, autoSubmit: data.autoSubmit };
+    }
+    if (typeof data?.englishDialect === "string" && isEnglishDialectMode(data.englishDialect)) {
+      state = { ...state, englishDialect: data.englishDialect };
+    }
+    if (typeof data?.processingText === "string") {
+      state = { ...state, processingText: normalizeProcessingText(data.processingText) };
+    }
+    if (typeof data?.showProcessingStatus === "boolean") {
+      state = { ...state, showProcessingStatus: data.showProcessingStatus };
+    }
   }
 
   return state;
@@ -905,8 +1221,20 @@ function persistCurrentReviewPreferences(
   targetLanguage: string,
   reviewerModel: string | undefined,
   reviewerThinking: ReviewerThinkingLevel,
+  autoSubmit: boolean,
+  englishDialect: EnglishDialectMode,
+  processingText: string,
+  showProcessingStatus: boolean,
 ): void {
-  persistReviewPreferences({ targetLanguage, reviewerModel, reviewerThinking });
+  persistReviewPreferences({
+    targetLanguage,
+    reviewerModel,
+    reviewerThinking,
+    autoSubmit,
+    englishDialect,
+    processingText: normalizeProcessingText(processingText),
+    showProcessingStatus,
+  });
 }
 
 function updateStatus(
@@ -914,22 +1242,23 @@ function updateStatus(
   enabled: boolean,
   contextMode: ReviewContextMode,
   targetLanguage: string,
-  busy: boolean,
+  autoSubmit: boolean,
+  englishDialect: EnglishDialectMode,
+  _processingText: string,
+  _showProcessingStatus: boolean,
+  _busy: boolean,
 ): void {
   if (!ctx?.hasUI) return;
 
   const languageSuffix = isMatchInputTargetLanguage(targetLanguage) ? "" : `/${targetLanguage}`;
-
-  if (busy) {
-    ctx.ui.setStatus("prompt-review", ctx.ui.theme.fg("warning", `PR:reviewing/${contextMode}${languageSuffix}`));
-    return;
-  }
+  const autoSubmitSuffix = autoSubmit ? "/auto" : "";
+  const dialectSuffix = englishDialect === "auto" ? "" : `/${englishDialect}`;
 
   ctx.ui.setStatus(
     "prompt-review",
     enabled
-      ? ctx.ui.theme.fg("accent", `PR:on/${contextMode}${languageSuffix}`)
-      : ctx.ui.theme.fg("dim", `PR:off/${contextMode}${languageSuffix}`),
+      ? ctx.ui.theme.fg("accent", `PR:on/${contextMode}${autoSubmitSuffix}${dialectSuffix}${languageSuffix}`)
+      : ctx.ui.theme.fg("dim", `PR:off/${contextMode}${autoSubmitSuffix}${dialectSuffix}${languageSuffix}`),
   );
 }
 
@@ -1014,10 +1343,16 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
   let targetLanguage = DEFAULT_TARGET_LANGUAGE;
   let reviewerModel: string | undefined;
   let reviewerThinking: ReviewerThinkingLevel = DEFAULT_REVIEWER_THINKING;
+  let autoSubmit = false;
+  let englishDialect: EnglishDialectMode = DEFAULT_ENGLISH_DIALECT;
+  let processingText = DEFAULT_PROCESSING_TEXT;
+  let showProcessingStatus = true;
   let approvedPrompt: string | undefined;
   let activeReview: ActiveReview | undefined;
   let currentCtx: ExtensionContext | undefined;
   let reviewInFlight = false;
+  let reviewIndicatorTimer: ReturnType<typeof setInterval> | undefined;
+  let reviewIndicatorFrame = 0;
 
   const clearReviewWidget = (ctx: ExtensionContext | undefined = currentCtx) => {
     if (!ctx?.hasUI) return;
@@ -1031,7 +1366,7 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
     approvedPrompt = text;
     currentCtx.ui.setEditorText(text);
     currentCtx.ui.notify(message, "info");
-    updateStatus(currentCtx, enabled, contextMode, targetLanguage, reviewInFlight);
+    updateStatus(currentCtx, enabled, contextMode, targetLanguage, autoSubmit, englishDialect, processingText, showProcessingStatus, reviewInFlight);
   };
 
   const revertActiveReview = (ctx: ExtensionContext) => {
@@ -1084,8 +1419,41 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
     activeReview = undefined;
     clearReviewWidget(ctx);
     ctx.ui.setEditorText("");
-    updateStatus(ctx, enabled, contextMode, targetLanguage, reviewInFlight);
+    updateStatus(ctx, enabled, contextMode, targetLanguage, autoSubmit, englishDialect, processingText, showProcessingStatus, reviewInFlight);
     ctx.ui.notify(sendImmediately ? "Submitted without prompt review." : "Queued without prompt review.", "info");
+  };
+
+  const renderReviewProcessingWidget = (ctx: ExtensionContext) => {
+    if (!ctx.hasUI) return;
+    const frame = REVIEW_INDICATOR_FRAMES[reviewIndicatorFrame % REVIEW_INDICATOR_FRAMES.length];
+    const message = `${frame} ${formatProcessingText(processingText)}`;
+    ctx.ui.setWidget(REVIEW_WIDGET_KEY, (_tui, theme) => ({
+      render: (width) => wrapTextWithAnsi(theme.fg("warning", message), Math.max(1, width)),
+      invalidate: () => {},
+    }));
+  };
+
+  const setReviewWorkingMessage = (ctx: ExtensionContext, working: boolean) => {
+    if (!ctx.hasUI) return;
+
+    if (reviewIndicatorTimer) {
+      clearInterval(reviewIndicatorTimer);
+      reviewIndicatorTimer = undefined;
+    }
+
+    if (!working || !showProcessingStatus) {
+      ctx.ui.setWorkingMessage(undefined);
+      clearReviewWidget(ctx);
+      return;
+    }
+
+    ctx.ui.setWorkingMessage(formatProcessingText(processingText));
+    reviewIndicatorFrame = 0;
+    renderReviewProcessingWidget(ctx);
+    reviewIndicatorTimer = setInterval(() => {
+      reviewIndicatorFrame += 1;
+      renderReviewProcessingWidget(ctx);
+    }, 120);
   };
 
   const showReviewWidget = (
@@ -1130,7 +1498,7 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
   ): Promise<ReviewRunResult> => {
     return await runReviewSession(
       ctx,
-      buildReviewPrompt(pending.originalText, pending.targetLanguage, pending.reviewContext),
+      buildReviewPrompt(pending.originalText, pending.targetLanguage, pending.englishDialect, pending.reviewContext),
       model,
       thinking,
     );
@@ -1143,12 +1511,17 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
     activeReview = undefined;
     reviewInFlight = false;
     clearReviewWidget(ctx);
+    setReviewWorkingMessage(ctx, false);
 
     const state = readState(ctx);
     const loadedPreferences = readReviewPreferences({
       targetLanguage: state.targetLanguage,
       reviewerModel: state.reviewerModel,
       reviewerThinking: state.reviewerThinking,
+      autoSubmit: state.autoSubmit,
+      englishDialect: state.englishDialect,
+      processingText: state.processingText,
+      showProcessingStatus: state.showProcessingStatus,
     });
 
     enabled = state.enabled;
@@ -1156,12 +1529,16 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
     targetLanguage = loadedPreferences.preferences.targetLanguage;
     reviewerModel = loadedPreferences.preferences.reviewerModel;
     reviewerThinking = loadedPreferences.preferences.reviewerThinking;
+    autoSubmit = loadedPreferences.preferences.autoSubmit;
+    englishDialect = loadedPreferences.preferences.englishDialect;
+    processingText = loadedPreferences.preferences.processingText;
+    showProcessingStatus = loadedPreferences.preferences.showProcessingStatus;
 
     if (loadedPreferences.source === "missing" && hasCustomReviewPreferences(loadedPreferences.preferences)) {
       persistReviewPreferences(loadedPreferences.preferences);
     }
 
-    updateStatus(ctx, enabled, contextMode, targetLanguage, false);
+    updateStatus(ctx, enabled, contextMode, targetLanguage, autoSubmit, englishDialect, processingText, showProcessingStatus, false);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
@@ -1170,12 +1547,13 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
     activeReview = undefined;
     reviewInFlight = false;
     clearReviewWidget(ctx);
+    setReviewWorkingMessage(ctx, false);
     currentCtx = undefined;
     if (ctx.hasUI) ctx.ui.setStatus("prompt-review", undefined);
   });
 
   pi.registerCommand("prompt-review", {
-    description: "Toggle prompt review and configure reviewer context, language, model, and thinking",
+    description: "Toggle prompt review and configure reviewer context, auto-submit, English dialect, processing status, language, model, and thinking",
     getArgumentCompletions: (prefix) => getCommandCompletions(prefix),
     handler: async (args, ctx) => {
       currentCtx = ctx;
@@ -1184,7 +1562,7 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
       const [action, value, ...rest] = tokens;
 
       if (!action || action === "status") {
-        const message = buildStatusText(enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking);
+        const message = buildStatusText(enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking, autoSubmit, englishDialect, processingText, showProcessingStatus);
         if (ctx.hasUI) {
           ctx.ui.notify(message, "info");
         } else {
@@ -1194,7 +1572,7 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
       }
 
       if (action === "help") {
-        const helpText = buildHelpText(enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking);
+        const helpText = buildHelpText(enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking, autoSubmit, englishDialect, processingText, showProcessingStatus);
         if (ctx.hasUI) {
           await ctx.ui.confirm("Prompt review help", helpText);
         } else {
@@ -1235,10 +1613,176 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
         }
 
         contextMode = normalizeCommand(value) as ReviewContextMode;
-        persistState(pi, { enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking });
-        updateStatus(ctx, enabled, contextMode, targetLanguage, reviewInFlight);
+        persistState(pi, { enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking, autoSubmit, englishDialect, processingText, showProcessingStatus });
+        updateStatus(ctx, enabled, contextMode, targetLanguage, autoSubmit, englishDialect, processingText, showProcessingStatus, reviewInFlight);
 
         const message = buildContextModeText(contextMode);
+        if (ctx.hasUI) {
+          ctx.ui.notify(message, "info");
+        } else {
+          process.stdout.write(`${message}\n`);
+        }
+        return;
+      }
+
+      if (action === "autosubmit") {
+        if (rest.length > 0) {
+          const message = `Too many arguments for /prompt-review autosubmit. Use one of: ${AUTOSUBMIT_OPTIONS.join(", ")}.`;
+          if (ctx.hasUI) {
+            ctx.ui.notify(message, "error");
+          } else {
+            process.stderr.write(`${message}\n`);
+          }
+          return;
+        }
+
+        if (!value) {
+          const message = buildAutoSubmitText(autoSubmit);
+          if (ctx.hasUI) {
+            ctx.ui.notify(message, "info");
+          } else {
+            process.stdout.write(`${message}\n`);
+          }
+          return;
+        }
+
+        const normalizedAutoSubmit = normalizeCommand(value);
+        if (!AUTOSUBMIT_OPTIONS.includes(normalizedAutoSubmit as typeof AUTOSUBMIT_OPTIONS[number])) {
+          const message = `Unknown autosubmit mode: ${value}. Use one of: ${AUTOSUBMIT_OPTIONS.join(", ")}.`;
+          if (ctx.hasUI) {
+            ctx.ui.notify(message, "error");
+          } else {
+            process.stderr.write(`${message}\n`);
+          }
+          return;
+        }
+
+        autoSubmit = normalizedAutoSubmit === "on";
+        persistState(pi, { enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking, autoSubmit, englishDialect, processingText, showProcessingStatus });
+        persistCurrentReviewPreferences(targetLanguage, reviewerModel, reviewerThinking, autoSubmit, englishDialect, processingText, showProcessingStatus);
+        updateStatus(ctx, enabled, contextMode, targetLanguage, autoSubmit, englishDialect, processingText, showProcessingStatus, reviewInFlight);
+
+        const message = buildAutoSubmitText(autoSubmit);
+        if (ctx.hasUI) {
+          ctx.ui.notify(message, "info");
+        } else {
+          process.stdout.write(`${message}\n`);
+        }
+        return;
+      }
+
+      if (action === "dialect") {
+        if (rest.length > 0) {
+          const message = `Too many arguments for /prompt-review dialect. Use one of: ${ENGLISH_DIALECT_OPTIONS.join(", ")}.`;
+          if (ctx.hasUI) {
+            ctx.ui.notify(message, "error");
+          } else {
+            process.stderr.write(`${message}\n`);
+          }
+          return;
+        }
+
+        if (!value) {
+          const message = buildDialectText(englishDialect);
+          if (ctx.hasUI) {
+            ctx.ui.notify(message, "info");
+          } else {
+            process.stdout.write(`${message}\n`);
+          }
+          return;
+        }
+
+        const normalizedDialect = normalizeCommand(value);
+        if (!isEnglishDialectMode(normalizedDialect)) {
+          const message = `Unknown English dialect mode: ${value}. Use one of: ${ENGLISH_DIALECT_OPTIONS.join(", ")}.`;
+          if (ctx.hasUI) {
+            ctx.ui.notify(message, "error");
+          } else {
+            process.stderr.write(`${message}\n`);
+          }
+          return;
+        }
+
+        englishDialect = normalizedDialect;
+        persistState(pi, { enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking, autoSubmit, englishDialect, processingText, showProcessingStatus });
+        persistCurrentReviewPreferences(targetLanguage, reviewerModel, reviewerThinking, autoSubmit, englishDialect, processingText, showProcessingStatus);
+        updateStatus(ctx, enabled, contextMode, targetLanguage, autoSubmit, englishDialect, processingText, showProcessingStatus, reviewInFlight);
+
+        const message = buildDialectText(englishDialect);
+        if (ctx.hasUI) {
+          ctx.ui.notify(message, "info");
+        } else {
+          process.stdout.write(`${message}\n`);
+        }
+        return;
+      }
+
+      if (action === "processing") {
+        const requestedProcessingText = args.slice(action.length).trim();
+
+        if (!requestedProcessingText) {
+          const message = buildProcessingText(processingText);
+          if (ctx.hasUI) {
+            ctx.ui.notify(message, "info");
+          } else {
+            process.stdout.write(`${message}\n`);
+          }
+          return;
+        }
+
+        processingText = normalizeProcessingText(requestedProcessingText);
+        persistState(pi, { enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking, autoSubmit, englishDialect, processingText, showProcessingStatus });
+        persistCurrentReviewPreferences(targetLanguage, reviewerModel, reviewerThinking, autoSubmit, englishDialect, processingText, showProcessingStatus);
+        updateStatus(ctx, enabled, contextMode, targetLanguage, autoSubmit, englishDialect, processingText, showProcessingStatus, reviewInFlight);
+
+        const message = buildProcessingText(processingText);
+        if (ctx.hasUI) {
+          ctx.ui.notify(message, "info");
+        } else {
+          process.stdout.write(`${message}\n`);
+        }
+        return;
+      }
+
+      if (action === "processing-status") {
+        if (rest.length > 0) {
+          const message = `Too many arguments for /prompt-review processing-status. Use one of: ${PROCESSING_STATUS_OPTIONS.join(", ")}.`;
+          if (ctx.hasUI) {
+            ctx.ui.notify(message, "error");
+          } else {
+            process.stderr.write(`${message}\n`);
+          }
+          return;
+        }
+
+        if (!value) {
+          const message = buildProcessingStatusText(showProcessingStatus);
+          if (ctx.hasUI) {
+            ctx.ui.notify(message, "info");
+          } else {
+            process.stdout.write(`${message}\n`);
+          }
+          return;
+        }
+
+        const normalizedProcessingStatus = normalizeCommand(value);
+        if (!PROCESSING_STATUS_OPTIONS.includes(normalizedProcessingStatus as typeof PROCESSING_STATUS_OPTIONS[number])) {
+          const message = `Unknown processing status mode: ${value}. Use one of: ${PROCESSING_STATUS_OPTIONS.join(", ")}.`;
+          if (ctx.hasUI) {
+            ctx.ui.notify(message, "error");
+          } else {
+            process.stderr.write(`${message}\n`);
+          }
+          return;
+        }
+
+        showProcessingStatus = normalizedProcessingStatus === "on";
+        if (!showProcessingStatus) setReviewWorkingMessage(ctx, false);
+        persistState(pi, { enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking, autoSubmit, englishDialect, processingText, showProcessingStatus });
+        persistCurrentReviewPreferences(targetLanguage, reviewerModel, reviewerThinking, autoSubmit, englishDialect, processingText, showProcessingStatus);
+        updateStatus(ctx, enabled, contextMode, targetLanguage, autoSubmit, englishDialect, processingText, showProcessingStatus, reviewInFlight);
+
+        const message = buildProcessingStatusText(showProcessingStatus);
         if (ctx.hasUI) {
           ctx.ui.notify(message, "info");
         } else {
@@ -1261,9 +1805,9 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
         }
 
         targetLanguage = requestedLanguage;
-        persistState(pi, { enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking });
-        persistCurrentReviewPreferences(targetLanguage, reviewerModel, reviewerThinking);
-        updateStatus(ctx, enabled, contextMode, targetLanguage, reviewInFlight);
+        persistState(pi, { enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking, autoSubmit, englishDialect, processingText, showProcessingStatus });
+        persistCurrentReviewPreferences(targetLanguage, reviewerModel, reviewerThinking, autoSubmit, englishDialect, processingText, showProcessingStatus);
+        updateStatus(ctx, enabled, contextMode, targetLanguage, autoSubmit, englishDialect, processingText, showProcessingStatus, reviewInFlight);
 
         const message = buildTargetLanguageText(targetLanguage);
         if (ctx.hasUI) {
@@ -1297,8 +1841,8 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
 
         if (normalizeCommand(value) === "auto") {
           reviewerModel = undefined;
-          persistState(pi, { enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking });
-          persistCurrentReviewPreferences(targetLanguage, reviewerModel, reviewerThinking);
+          persistState(pi, { enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking, autoSubmit, englishDialect, processingText, showProcessingStatus });
+          persistCurrentReviewPreferences(targetLanguage, reviewerModel, reviewerThinking, autoSubmit, englishDialect, processingText, showProcessingStatus);
           const message = buildModelText(reviewerModel);
           if (ctx.hasUI) {
             ctx.ui.notify(message, "info");
@@ -1336,8 +1880,8 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
         }
 
         reviewerModel = toCanonicalModelId(resolvedModel.info);
-        persistState(pi, { enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking });
-        persistCurrentReviewPreferences(targetLanguage, reviewerModel, reviewerThinking);
+        persistState(pi, { enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking, autoSubmit, englishDialect, processingText, showProcessingStatus });
+        persistCurrentReviewPreferences(targetLanguage, reviewerModel, reviewerThinking, autoSubmit, englishDialect, processingText, showProcessingStatus);
 
         const message = buildModelText(reviewerModel);
         if (ctx.hasUI) {
@@ -1406,8 +1950,8 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
         }
 
         reviewerThinking = requestedReviewerThinking;
-        persistState(pi, { enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking });
-        persistCurrentReviewPreferences(targetLanguage, reviewerModel, reviewerThinking);
+        persistState(pi, { enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking, autoSubmit, englishDialect, processingText, showProcessingStatus });
+        persistCurrentReviewPreferences(targetLanguage, reviewerModel, reviewerThinking, autoSubmit, englishDialect, processingText, showProcessingStatus);
 
         const message = buildThinkingText(reviewerThinking);
         if (ctx.hasUI) {
@@ -1464,10 +2008,10 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
         activeReview = undefined;
         clearReviewWidget(ctx);
       }
-      persistState(pi, { enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking });
-      updateStatus(ctx, enabled, contextMode, targetLanguage, reviewInFlight);
+      persistState(pi, { enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking, autoSubmit, englishDialect, processingText, showProcessingStatus });
+      updateStatus(ctx, enabled, contextMode, targetLanguage, autoSubmit, englishDialect, processingText, showProcessingStatus, reviewInFlight);
 
-      const message = buildStatusText(enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking);
+      const message = buildStatusText(enabled, contextMode, targetLanguage, reviewerModel, reviewerThinking, autoSubmit, englishDialect, processingText, showProcessingStatus);
       if (ctx.hasUI) {
         ctx.ui.notify(message, "info");
       } else {
@@ -1544,13 +2088,15 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
       targetLanguage,
       reviewerModelLabel: formatModelLabel(reviewerModelMeta),
       reviewerThinking: effectiveReviewerThinking,
+      englishDialect,
       reviewContext,
       retryCount: 0,
     };
 
     approvedPrompt = undefined;
     reviewInFlight = true;
-    updateStatus(ctx, enabled, contextMode, targetLanguage, true);
+    setReviewWorkingMessage(ctx, true);
+    updateStatus(ctx, enabled, contextMode, targetLanguage, autoSubmit, englishDialect, processingText, showProcessingStatus, true);
     ctx.ui.notify(
       reviewContext ? "Reviewing prompt with recent conversation context…" : "Reviewing prompt…",
       "info",
@@ -1561,7 +2107,8 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
       reviewRun = await runPromptReview(ctx, pending, resolvedReviewerModel?.model as Model<any> | undefined, effectiveReviewerThinking);
     } catch (error) {
       reviewInFlight = false;
-      updateStatus(ctx, enabled, contextMode, targetLanguage, false);
+      setReviewWorkingMessage(ctx, false);
+      updateStatus(ctx, enabled, contextMode, targetLanguage, autoSubmit, englishDialect, processingText, showProcessingStatus, false);
       restorePromptToEditor(
         pending.originalText,
         `Prompt review failed with ${pending.reviewerModelLabel} (thinking: ${pending.reviewerThinking}): ${error instanceof Error ? error.message : String(error)}. Original prompt restored. Press Enter again to send it.`,
@@ -1572,7 +2119,8 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
     if (!reviewRun.resultText) {
       if (!currentCtx?.model) {
         reviewInFlight = false;
-        updateStatus(ctx, enabled, contextMode, targetLanguage, false);
+        setReviewWorkingMessage(ctx, false);
+        updateStatus(ctx, enabled, contextMode, targetLanguage, autoSubmit, englishDialect, processingText, showProcessingStatus, false);
         restorePromptToEditor(
           pending.originalText,
           `Prompt review failed with ${pending.reviewerModelLabel} (thinking: ${pending.reviewerThinking}): no result was returned by the reviewer. Original prompt restored. Press Enter again to send it.`,
@@ -1598,7 +2146,8 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
         pending.reviewerThinking = retryPending.reviewerThinking;
       } catch (error) {
         reviewInFlight = false;
-        updateStatus(ctx, enabled, contextMode, targetLanguage, false);
+        setReviewWorkingMessage(ctx, false);
+        updateStatus(ctx, enabled, contextMode, targetLanguage, autoSubmit, englishDialect, processingText, showProcessingStatus, false);
         restorePromptToEditor(
           pending.originalText,
           `Prompt review failed with ${retryPending.reviewerModelLabel} (thinking: ${retryPending.reviewerThinking}): ${error instanceof Error ? error.message : String(error)}. Original prompt restored. Press Enter again to send it.`,
@@ -1608,7 +2157,8 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
 
       if (!reviewRun.resultText) {
         reviewInFlight = false;
-        updateStatus(ctx, enabled, contextMode, targetLanguage, false);
+        setReviewWorkingMessage(ctx, false);
+        updateStatus(ctx, enabled, contextMode, targetLanguage, autoSubmit, englishDialect, processingText, showProcessingStatus, false);
         restorePromptToEditor(
           pending.originalText,
           `Prompt review failed with ${pending.reviewerModelLabel} (thinking: ${pending.reviewerThinking}): no result was returned by the reviewer. Original prompt restored. Press Enter again to send it.`,
@@ -1618,11 +2168,64 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
     }
 
     reviewInFlight = false;
-    updateStatus(ctx, enabled, contextMode, targetLanguage, false);
+    setReviewWorkingMessage(ctx, false);
+    updateStatus(ctx, enabled, contextMode, targetLanguage, autoSubmit, englishDialect, processingText, showProcessingStatus, false);
 
     const review = parseReview(reviewRun.resultText);
-    const candidatePrompt = review.prompt || pending.originalText;
+    const useBritishEnglish = shouldUseBritishEnglish(pending.targetLanguage, pending.englishDialect);
+    const applyConfiguredDialect = (text: string) => {
+      if (useBritishEnglish) return applyBritishEnglish(text);
+      return text;
+    };
+    const rawCandidatePrompt = review.prompt || pending.originalText;
+    const candidatePrompt = applyConfiguredDialect(rawCandidatePrompt);
+    if (useBritishEnglish) {
+      review.questions = review.questions.map((question) => applyConfiguredDialect(question));
+    }
     const changed = candidatePrompt.trim() !== pending.originalText.trim();
+
+    if (autoSubmit && review.decision !== "needs_clarification") {
+      const sendImmediately = ctx.isIdle();
+
+      try {
+        pi.sendUserMessage(candidatePrompt, sendImmediately ? undefined : { deliverAs: "followUp" });
+      } catch (error) {
+        approvedPrompt = candidatePrompt;
+        activeReview = {
+          originalText: pending.originalText,
+          reviewedText: candidatePrompt,
+        };
+        ctx.ui.setEditorText(candidatePrompt);
+        showReviewWidget(
+          ctx,
+          review,
+          changed,
+          pending.contextLabel,
+          pending.targetLanguage,
+          pending.reviewerModelLabel,
+          pending.reviewerThinking,
+          reviewRun.tokens,
+          reviewRun.cost,
+        );
+        ctx.ui.notify(
+          `Prompt review auto-submit failed: ${error instanceof Error ? error.message : String(error)}. Reviewed prompt loaded for manual submission.`,
+          "error",
+        );
+        updateStatus(ctx, enabled, contextMode, targetLanguage, autoSubmit, englishDialect, processingText, showProcessingStatus, false);
+        return { action: "handled" };
+      }
+
+      approvedPrompt = undefined;
+      activeReview = undefined;
+      clearReviewWidget(ctx);
+      ctx.ui.setEditorText("");
+      ctx.ui.notify(
+        `Reviewed prompt ${changed ? "updated and " : ""}auto-submitted${sendImmediately ? "" : " as a follow-up"}.`,
+        "info",
+      );
+      updateStatus(ctx, enabled, contextMode, targetLanguage, autoSubmit, englishDialect, processingText, showProcessingStatus, false);
+      return { action: "handled" };
+    }
 
     approvedPrompt = candidatePrompt;
     activeReview = {
@@ -1642,10 +2245,12 @@ export default function promptReviewExtension(pi: ExtensionAPI) {
       reviewRun.cost,
     );
     ctx.ui.notify(
-      `Reviewed prompt loaded. Press Enter to send it, use /prompt-review revert or ${REVERT_SHORTCUT_LABEL} to restore the original, or press ${SUBMIT_WITHOUT_REVIEW_SHORTCUT_LABEL} to submit without review.`,
-      "info",
+      autoSubmit
+        ? `Prompt review needs clarification, so auto-submit was skipped. Press Enter to send the reviewed prompt, use /prompt-review revert or ${REVERT_SHORTCUT_LABEL} to restore the original, or press ${SUBMIT_WITHOUT_REVIEW_SHORTCUT_LABEL} to submit without review.`
+        : `Reviewed prompt loaded. Press Enter to send it, use /prompt-review revert or ${REVERT_SHORTCUT_LABEL} to restore the original, or press ${SUBMIT_WITHOUT_REVIEW_SHORTCUT_LABEL} to submit without review.`,
+      autoSubmit ? "warning" : "info",
     );
-    updateStatus(ctx, enabled, contextMode, targetLanguage, false);
+    updateStatus(ctx, enabled, contextMode, targetLanguage, autoSubmit, englishDialect, processingText, showProcessingStatus, false);
 
     return { action: "handled" };
   });

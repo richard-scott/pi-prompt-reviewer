@@ -11,16 +11,19 @@ original request was unclear.
 `pi-prompt-reviewer` is a [pi](https://pi.dev) extension that reviews your
 prompt before it is sent to the main session.
 
-![pi-prompt-reviewer preview](https://raw.githubusercontent.com/surfdude75/pi-prompt-reviewer/refs/heads/master/assets/preview.png)
+![pi-prompt-reviewer preview](https://raw.githubusercontent.com/richard-scott/pi-prompt-reviewer/refs/heads/master/assets/preview.png)
 
 ## Features
 
 - intercepts normal prompts before they are sent
 - rewrites prompts for clarity while preserving intent
 - can include recent conversation context when useful
-- lets you choose the target language, reviewer model, and thinking level
-- remembers the target language, reviewer model, and thinking level across sessions
+- lets you choose the target language, English dialect, reviewer model, thinking level, auto-submit mode, and processing indicator behaviour
+- remembers the target language, English dialect, processing text/status, reviewer model, thinking level, and auto-submit mode across sessions
 - loads the reviewed prompt back into the editor automatically
+- can automatically submit ready/revised reviewed prompts
+- preserves English dialect, including deterministic British spelling normalisation when configured or detected
+- shows configurable processing text with a toggleable loading indicator while review runs
 - lets you submit immediately without review via `Ctrl+Shift+S`
 - lets you restore the original prompt with a command or shortcut
 - displays token usage and cost for the review step
@@ -28,7 +31,7 @@ prompt before it is sent to the main session.
 ## Install
 
 ```bash
-pi install npm:pi-prompt-reviewer
+pi install git:github.com/richard-scott/pi-prompt-reviewer
 ```
 
 After installing or editing the extension, reload pi:
@@ -41,11 +44,16 @@ After installing or editing the extension, reload pi:
 
 1. Type a normal prompt.
 2. Press Enter.
-3. The extension reviews it with a lightweight model.
-4. The reviewed prompt is loaded back into the editor.
-5. A review widget appears above the editor.
-6. Press Enter to send the reviewed prompt, restore the original first, or press
+3. If processing status is enabled, a loading indicator shows the configured processing text, defaulting to `Processing...`, while the reviewer runs.
+4. The extension reviews it with a lightweight model.
+5. By default, the reviewed prompt is loaded back into the editor.
+6. A review widget appears above the editor.
+7. Press Enter to send the reviewed prompt, restore the original first, or press
    Ctrl+Shift+S to submit the current editor contents without review.
+
+When auto-submit is enabled, ready/revised reviewed prompts are sent to the main
+session immediately instead of being loaded for manual approval. Auto-submit is
+skipped when the reviewer says the prompt needs clarification.
 
 ## Bypasses
 
@@ -84,6 +92,10 @@ Ctrl+Shift+S
 /prompt-review help
 ```
 
+Status includes the current context mode, target language, English dialect,
+processing text, processing status visibility, reviewer model, thinking level,
+and auto-submit setting.
+
 ### Restore the original prompt after review
 
 ```text
@@ -110,18 +122,99 @@ Context modes:
 - `always`: always send the previous user prompt and last assistant reply when
   they exist
 
+### Configure auto-submit
+
+```text
+/prompt-review autosubmit
+/prompt-review autosubmit on
+/prompt-review autosubmit off
+```
+
+Auto-submit is off by default. When it is on, reviewed prompts whose decision is
+`ready` or `revised` are sent immediately. If the reviewer returns
+`needs_clarification`, the reviewed prompt is loaded into the editor for manual
+approval instead.
+
+### Configure processing text and status visibility
+
+```text
+/prompt-review processing
+/prompt-review processing Processing
+/prompt-review processing Reviewing prompt
+/prompt-review processing-status
+/prompt-review processing-status on
+/prompt-review processing-status off
+```
+
+The processing text is shown with a loading indicator while prompt review runs.
+It defaults to `Processing`, displayed as `Processing...`. Toggle the indicator
+and working message with `processing-status on|off`. When processing status is
+off, the reviewer still runs normally, but the in-progress loading indicator and
+working message are hidden. The persistent `PR:` footer status does not show the
+processing text. The values are saved in
+`~/.pi/agent/extensions/prompt-reviewer.json` as `processingText` and
+`showProcessingStatus`, so you can edit that config file directly if preferred.
+
+### Configure English dialect
+
+```text
+/prompt-review dialect
+/prompt-review dialect auto
+/prompt-review dialect british
+/prompt-review dialect us
+/prompt-review dialect preserve
+```
+
+Dialect modes:
+
+- `auto`: infer from target language, locale, and time zone
+- `british`: force British English with -ise spellings and instruct the reviewer to
+  normalise words with standard British `-ise` forms, such as `finalize` →
+  `finalise`, `theorize` → `theorise`, and `tantalize` → `tantalise`
+- `us`: instruct the reviewer to use US English
+- `preserve`: preserve the prompt's existing dialect
+
 ### Configure target language
 
 ```text
 /prompt-review language
 /prompt-review language match input
 /prompt-review language English
+/prompt-review language UK English
 /prompt-review language Brazilian Portuguese
 ```
 
-The default is `match input`, which keeps the reviewed prompt in the same
-language as your input prompt. Set a specific language to have the reviewer
-translate the reviewed prompt as needed.
+The default is `match input`. Set a specific language to have the reviewer
+translate the reviewed prompt as needed. In `auto` mode, `UK English` and
+`British English` force British -ise spellings such as `finalise`,
+`analyse`, and `colour`.
+
+Built-in target language completions:
+
+- `match input`
+- `English`
+- `UK English`
+- `British English`
+- `US English`
+- `American English`
+- `Spanish`
+- `French`
+- `German`
+- `Italian`
+- `Portuguese`
+- `Brazilian Portuguese`
+- `Japanese`
+- `Korean`
+- `Chinese`
+- `Dutch`
+- `Polish`
+- `Russian`
+- `Ukrainian`
+- `Arabic`
+- `Hindi`
+
+You can also type a custom target language; known entries are mainly for
+completion and normalisation.
 
 ### Configure reviewer model
 
@@ -167,10 +260,26 @@ This is usually the best balance of speed, cost, and review quality.
 Thinking changes are also tested before they are saved. If the test fails, the
 extension warns you and keeps the previous reviewer thinking level.
 
-Target language, reviewer model, and reviewer thinking choices are saved across
-sessions. The enabled/disabled state and context mode remain session-specific.
+Target language, English dialect, processing text/status, reviewer model,
+reviewer thinking, and auto-submit choices are saved across sessions in
+`~/.pi/agent/extensions/prompt-reviewer.json`. The enabled/disabled state and
+context mode remain session-specific.
 
-## Retry behavior
+Example preferences file:
+
+```json
+{
+  "targetLanguage": "UK English",
+  "reviewerModel": "auto",
+  "reviewerThinking": "off",
+  "autoSubmit": true,
+  "englishDialect": "british",
+  "processingText": "Processing",
+  "showProcessingStatus": true
+}
+```
+
+## Retry behaviour
 
 If the first reviewer run returns no text, the extension retries once using the
 current session model with thinking set to `off`.
