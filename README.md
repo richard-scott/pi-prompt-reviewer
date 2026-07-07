@@ -11,7 +11,7 @@ original request was unclear.
 `pi-prompt-reviewer` is a [pi](https://pi.dev) extension that reviews your
 prompt before it is sent to the main session.
 
-![pi-prompt-reviewer preview](https://raw.githubusercontent.com/richard-scott/pi-prompt-reviewer/refs/heads/master/assets/preview.png)
+![pi-prompt-reviewer preview](https://raw.githubusercontent.com/surfdude75/pi-prompt-reviewer/refs/heads/master/assets/preview.png)
 
 ## Features
 
@@ -31,7 +31,7 @@ prompt before it is sent to the main session.
 ## Install
 
 ```bash
-pi install git:github.com/richard-scott/pi-prompt-reviewer
+pi install npm:pi-prompt-reviewer
 ```
 
 After installing or editing the extension, reload pi:
