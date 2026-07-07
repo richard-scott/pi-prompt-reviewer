@@ -150,8 +150,7 @@ The processing text is shown with a loading indicator while prompt review runs.
 It defaults to `Processing`, displayed as `Processing...`. Toggle the indicator
 and working message with `processing-status on|off`. When processing status is
 off, the reviewer still runs normally, but the in-progress loading indicator and
-working message are hidden. The persistent `PR:` footer status does not show the
-processing text. The values are saved in
+working message are hidden. These values are saved in
 `~/.pi/agent/extensions/prompt-reviewer.json` as `processingText` and
 `showProcessingStatus`, so you can edit that config file directly if preferred.
 

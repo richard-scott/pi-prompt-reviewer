@@ -1239,27 +1239,17 @@ function persistCurrentReviewPreferences(
 
 function updateStatus(
   ctx: ExtensionContext | undefined,
-  enabled: boolean,
-  contextMode: ReviewContextMode,
-  targetLanguage: string,
-  autoSubmit: boolean,
-  englishDialect: EnglishDialectMode,
+  _enabled: boolean,
+  _contextMode: ReviewContextMode,
+  _targetLanguage: string,
+  _autoSubmit: boolean,
+  _englishDialect: EnglishDialectMode,
   _processingText: string,
   _showProcessingStatus: boolean,
   _busy: boolean,
 ): void {
   if (!ctx?.hasUI) return;
-
-  const languageSuffix = isMatchInputTargetLanguage(targetLanguage) ? "" : `/${targetLanguage}`;
-  const autoSubmitSuffix = autoSubmit ? "/auto" : "";
-  const dialectSuffix = englishDialect === "auto" ? "" : `/${englishDialect}`;
-
-  ctx.ui.setStatus(
-    "prompt-review",
-    enabled
-      ? ctx.ui.theme.fg("accent", `PR:on/${contextMode}${autoSubmitSuffix}${dialectSuffix}${languageSuffix}`)
-      : ctx.ui.theme.fg("dim", `PR:off/${contextMode}${autoSubmitSuffix}${dialectSuffix}${languageSuffix}`),
-  );
+  ctx.ui.setStatus("prompt-review", undefined);
 }
 
 function extractTextContent(content: unknown): string {
